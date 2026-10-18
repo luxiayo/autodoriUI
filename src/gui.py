@@ -32,7 +32,9 @@ class QueueHandler(logging.Handler):
 class FilteringFileHandler(logging.FileHandler):
     def emit(self, record):
         msg = record.getMessage()
-        if msg.startswith("send operation:"):
+        # The raw minitouch command stream is only useful when explicitly
+        # debugging, and it is far too heavy to keep by default.
+        if msg.startswith("send operation:") and not getattr(autodori, "DEBUG_LOGGING", False):
             return
         super().emit(record)
 
@@ -69,7 +71,8 @@ class AutodoriGUI:
             'CONFIDENCE_THRESHOLD_FAILURE': float,
             'CONFIDENCE_THRESHOLD_PLAY': float,
             'IS_FULL_SONG': bool,
-            'IS_HIGH_DIFFICULTY': bool
+            'IS_HIGH_DIFFICULTY': bool,
+            'DEBUG_LOGGING': bool
         }
         self.load_settings()  # 初始化变量后加载配置
 
@@ -448,7 +451,8 @@ class AutodoriGUI:
             'CONFIDENCE_THRESHOLD_FAILURE': float,
             'CONFIDENCE_THRESHOLD_PLAY': float,
             'IS_FULL_SONG': bool,
-            'IS_HIGH_DIFFICULTY': bool
+            'IS_HIGH_DIFFICULTY': bool,
+            'DEBUG_LOGGING': bool
         }
 
         # --- 新增：本地化文本映射 ---
@@ -464,7 +468,8 @@ class AutodoriGUI:
             'CONFIDENCE_THRESHOLD_FAILURE': "失败检测置信度",
             'CONFIDENCE_THRESHOLD_PLAY': "歌曲开始检测置信度",
             'IS_FULL_SONG': "FULL乐曲支持",
-            'IS_HIGH_DIFFICULTY': "超高难易度支持"
+            'IS_HIGH_DIFFICULTY': "超高难易度支持",
+            'DEBUG_LOGGING': "调试日志（每片时序 + 指令流）"
         }
 
         # 使用 grid 布局

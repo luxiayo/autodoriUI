@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import datetime
 import json
 import logging
@@ -61,7 +61,7 @@ from minitouchpy import (
 
 import player
 from api import BestdoriAPI
-from chart import Chart, PlayRecord
+from chart import Chart, PlayRecord, TAIL_RELEASE_GRACE_MS
 from util import *
 import version
 import cv2
@@ -92,6 +92,11 @@ PLAY_COUNT_TARGET = 9  # boot_auto mode: stop the task after this many completed
 PLAY_COMPLETED_COUNT = 0  # boot_auto mode: songs completed in the current task session
 PLAY_FAILED_TIMES = 0
 HUMAN_DELAY_ENABLED = False
+# Verbose timing instrumentation: per-slice underrun lines and the raw minitouch
+# command stream. The per-song summary (start frame, offsets, judgement) is
+# always logged; this switch only adds the noisy detail, so leave it off for
+# normal use and turn it on from the 全局变量调试 tab when debugging.
+DEBUG_LOGGING = False
 IS_FULL_SONG = False
 IS_HIGH_DIFFICULTY = False
 SUPPORTED_DIFFICULTIES = ['easy', 'normal', 'hard', 'expert', 'special']
@@ -733,6 +738,12 @@ def save_song(name):
 def play_song(stop_event, playback_started_event):
 
     logging.info("Start play")
+    logging.info(
+        f"Playback settings: song='{current_song_name}' difficulty={DIFFICULTY} "
+        f"photogate={PHOTOGATE_LATENCY}ms tail_grace={TAIL_RELEASE_GRACE_MS}ms "
+        f"slice={CMD_SLICE_SIZE} move_slice={DEFAULT_MOVE_SLICE_SIZE} "
+        f"humanize={HUMAN_DELAY_ENABLED} debug_log={DEBUG_LOGGING}"
+    )
     cmd_log_list.clear()
     reset_callback_data()
 
@@ -837,6 +848,13 @@ def play_song(stop_event, playback_started_event):
         max_underrun_ms = max(max_underrun_ms, underrun_ms)
         total_underrun_ms += underrun_ms
         slice_count += 1
+
+        if DEBUG_LOGGING:
+            offsets = " ".join(f"{k}={v:.2f}" for k, v in OFFSET.items())
+            logging.info(
+                f"slice {slice_count}: underrun={underrun_ms:+.1f}ms build={build_ms:.1f}ms "
+                f"publish={max_publish_ms:.1f}ms offsets[{offsets}]"
+            )
 
         if not has_more:
             break
