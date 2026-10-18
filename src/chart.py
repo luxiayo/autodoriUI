@@ -14,6 +14,11 @@ from api import BestdoriAPI
 import json
 import datetime
 
+# How long a Long/Slide finger keeps the final position after the tail time.
+# One 60 fps frame is 16.7 ms; 50 ms guarantees the game samples the end
+# position at least twice before the release.
+TAIL_RELEASE_GRACE_MS = 50
+
 
 def _data_path(relative_path) -> Path:
     """
@@ -310,7 +315,13 @@ class Chart:
                 if end_flick:
                     finger_end_time = to_time + 80
                 else:
-                    finger_end_time = to_time
+                    # The last interpolated move lands one slice early, so the
+                    # finger sits on the final position for only a few ms before
+                    # the release. That is shorter than one 60 fps frame, and the
+                    # game then judges the tail from the previous position, which
+                    # reads as an early release. Hold past the tail instead:
+                    # over-holding is harmless, cutting it short is not.
+                    finger_end_time = to_time + TAIL_RELEASE_GRACE_MS
                 finger = get_finger(
                     from_time,
                     finger_end_time,
