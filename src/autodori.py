@@ -994,11 +994,15 @@ def init_maa():
         input_methods=device.input_methods,
     """
 
+    # A freshly started emulator accepts the adb entry seconds before adbd
+    # answers, so give the controller a real window instead of 3 instant tries.
     is_connected = False
-    for i in range(3):
+    for attempt in range(1, 13):
         if maacontroller.post_connection().wait().succeeded:
             is_connected = True
             break
+        logging.info(f"Connecting to the controller failed, retrying ({attempt}/12)...")
+        time.sleep(5)
 
     if not is_connected:
         raise RuntimeError(f"Failed to connect controller to device {device.name}.")
@@ -1206,53 +1210,81 @@ def _find_mumu_install_dir():
     return None
 
 
-def _adb_devices_available():
+def _first_adb_device():
     try:
-        return bool(Toolkit.find_adb_devices())
+        devices = Toolkit.find_adb_devices()
     except Exception as e:
         logging.debug(f"find_adb_devices failed: {e}")
-        return False
+        return None
+    return devices[0] if devices else None
 
 
-def ensure_emulator_running(timeout: float = 180.0):
+def _adb_shell_ready(device) -> bool:
     """
-    Start the MuMu Player instance when no ADB device is reachable yet.
+    A device entry appears in adb long before Android is usable.
+
+    Measured on MuMu 12: the entry shows up at ~3 s (offline), MuMuManager
+    reports is_android_started at ~7 s, and `adb shell` only answers at ~13 s.
+    Probing with a real shell command is the only reliable readiness signal.
+    """
+    try:
+        output = subprocess.check_output(
+            [str(device.adb_path.absolute()), "-s", device.address, "shell", "echo", "ok"],
+            text=True,
+            timeout=10,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        logging.debug(f"adb shell probe failed: {e}")
+        return False
+    return "ok" in output
+
+
+def ensure_emulator_running(timeout: float = 240.0):
+    """
+    Start the MuMu Player instance when it is not usable yet, and wait until
+    Android is actually booted (not merely listed by adb).
 
     Only MuMu can be started this way. For LDPlayer the emulator has to be
     launched by the user, so a missing device is then reported by init_maa().
     """
-    if _adb_devices_available():
-        logging.info("Emulator already running, skipping launch.")
+    device = _first_adb_device()
+    if device is not None and _adb_shell_ready(device):
+        logging.info("Emulator already running and reachable over ADB.")
         return
 
-    install_dir = _find_mumu_install_dir()
-    if install_dir is None:
-        logging.warning("MuMu Player installation not found; assuming the emulator is started manually.")
-        return
+    if device is None:
+        install_dir = _find_mumu_install_dir()
+        if install_dir is None:
+            logging.warning("MuMu Player installation not found; assuming the emulator is started manually.")
+            return
 
-    manager = install_dir / MUMU_MANAGER_RELATIVE_PATH
-    instance_index = str((config or {}).get("emulator", {}).get("mumu_index", 0))
-    logging.info(f"Launching MuMu Player instance {instance_index}: {manager}")
+        manager = install_dir / MUMU_MANAGER_RELATIVE_PATH
+        instance_index = str((config or {}).get("emulator", {}).get("mumu_index", 0))
+        logging.info(f"Launching MuMu Player instance {instance_index}: {manager}")
 
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        subprocess.Popen(
-            [str(manager), "control", "-v", instance_index, "launch"],
-            creationflags=creation_flags,
-        )
-    except OSError as e:
-        logging.error(f"Failed to launch MuMu Player: {e}")
-        return
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            subprocess.Popen(
+                [str(manager), "control", "-v", instance_index, "launch"],
+                creationflags=creation_flags,
+            )
+        except OSError as e:
+            logging.error(f"Failed to launch MuMu Player: {e}")
+            return
+    else:
+        logging.info("Emulator process is running but adb is not usable yet, waiting for boot.")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        time.sleep(5)
-        if _adb_devices_available():
-            logging.info("Emulator is up and reachable over ADB.")
+        time.sleep(2)
+        device = _first_adb_device()
+        if device is not None and _adb_shell_ready(device):
+            logging.info(f"Emulator is up and reachable over ADB ({device.address}).")
             return
-        logging.info("Waiting for the emulator to become reachable over ADB...")
+        logging.info("Waiting for the emulator to finish booting...")
 
-    raise RuntimeError(f"Emulator did not come up within {timeout:.0f}s.")
+    raise RuntimeError(f"Emulator did not become usable within {timeout:.0f}s.")
 
 
 def init():
