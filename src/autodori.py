@@ -556,6 +556,88 @@ class SaveSong(CustomAction):
         return CustomAction.RunResult(True)
 
 
+@maaresource.custom_action("EnsureFav2Filter")
+class EnsureFav2Filter(CustomAction):
+    """
+    Make the song-select screen use the 收藏2 filter.
+
+    The left sidebar is a scrollable list of categories: 收藏2 is only visible
+    once the 收藏 group is expanded, and 收藏 itself can sit below the fold
+    (3D演出 / 原创歌曲 / 虚拟歌手 / J-POP ... push it out of view). A fixed
+    pipeline chain cannot express "look, maybe scroll, look again", and doing
+    it with error-handling jumps trips MAA's loop detection, so it lives here.
+    """
+
+    SIDEBAR_ROI = [0, 100, 200, 620]
+    MAX_ATTEMPTS = 4
+
+    @staticmethod
+    def _grab_image(fallback=None):
+        try:
+            return maacontroller.post_screencap().wait().get()
+        except Exception as e:
+            logging.debug(f"EnsureFav2Filter: screencap failed: {e}")
+            return fallback
+
+    @staticmethod
+    def _find(context, image, pattern):
+        if image is None:
+            return None
+        pipeline = {
+            "_fav_ocr": {
+                "recognition": "OCR",
+                "only_rec": False,
+                "roi": EnsureFav2Filter.SIDEBAR_ROI,
+                "expected": [pattern],
+            }
+        }
+        try:
+            res = context.run_recognition("_fav_ocr", image, pipeline)
+        except Exception as e:
+            logging.debug(f"EnsureFav2Filter: OCR for {pattern!r} failed: {e}")
+            return None
+        return res.best_result if res and res.best_result else None
+
+    @staticmethod
+    def _click(box):
+        x, y, w, h = box
+        maacontroller.post_click(int(x + w / 2), int(y + h / 2)).wait()
+
+    def run(self, context: Context, argv: CustomAction.RunArg):
+        # CustomAction.RunArg carries the recognition detail but no screenshot,
+        # so take one explicitly before looking at the sidebar.
+        image = self._grab_image()
+
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            hit = self._find(context, image, "收藏2")
+            if hit:
+                self._click(hit.box)
+                logging.info(f"Song filter: 收藏2 selected (attempt {attempt}).")
+                time.sleep(1.0)
+                return CustomAction.RunResult(True)
+
+            hit = self._find(context, image, "^收藏$")
+            if hit:
+                self._click(hit.box)
+                logging.info(f"Song filter: expanded the 收藏 group (attempt {attempt}).")
+                time.sleep(1.5)
+                image = self._grab_image(image)
+                hit = self._find(context, image, "收藏2")
+                if hit:
+                    self._click(hit.box)
+                    logging.info("Song filter: 收藏2 selected after expanding.")
+                    time.sleep(1.0)
+                    return CustomAction.RunResult(True)
+
+            logging.info(f"Song filter: 收藏2 not visible, scrolling the sidebar (attempt {attempt}).")
+            maacontroller.post_swipe(90, 620, 90, 260, 400).wait()
+            time.sleep(1.0)
+            image = self._grab_image(image)
+
+        logging.warning("Song filter: could not select 收藏2, keeping the current filter.")
+        return CustomAction.RunResult(True)
+
+
 def _similarity(a: str, b: str) -> int:
     """Case-insensitive, Unicode-safe similarity (keeps CJK titles intact)."""
     return fuzz.ratio(a.lower(), b.lower())

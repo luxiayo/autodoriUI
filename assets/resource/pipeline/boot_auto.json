@@ -8,7 +8,9 @@
       "boot_wait_main"
     ],
     "interrupt": [
+      "boot_tap_title_img",
       "boot_tap_title",
+      "next_button",
       "boot_dismiss_ok",
       "boot_dismiss_confirm",
       "boot_dismiss_close",
@@ -32,7 +34,9 @@
       "boot_click_live"
     ],
     "interrupt": [
+      "boot_tap_title_img",
       "boot_tap_title",
+      "next_button",
       "boot_open_menu",
       "boot_dismiss_ok",
       "boot_dismiss_confirm",
@@ -40,6 +44,13 @@
       "login_expired",
       "connect_failed"
     ]
+  },
+  "boot_tap_title_img": {
+    "recognition": "TemplateMatch",
+    "template": "boot/tap_to_start.png",
+    "threshold": 0.8,
+    "action": "Click",
+    "post_delay": 3000
   },
   "boot_tap_title": {
     "recognition": "OCR",
@@ -55,7 +66,9 @@
       "NOWLOADING",
       ".*TAP.*",
       ".*NEXT.*",
-      ".*LOADING.*"
+      ".*LOADING.*",
+      ".*STAR.*",
+      ".*START.*"
     ],
     "action": "Click",
     "post_delay": 3000
@@ -110,6 +123,7 @@
     ],
     "action": "Click",
     "post_delay": 2500,
+    "timeout": 15000,
     "next": [
       "boot_click_freelive"
     ]
@@ -120,65 +134,19 @@
     "threshold": 0.75,
     "action": "Click",
     "post_delay": 2500,
+    "timeout": 12000,
     "next": [
-      "boot_click_fav2"
+      "boot_select_fav2"
     ]
   },
-  "boot_click_fav2": {
-    "recognition": "OCR",
-    "roi": [
-      0,
-      100,
-      200,
-      620
-    ],
-    "expected": [
-      "收藏2"
-    ],
-    "action": "Click",
-    "timeout": 6000,
-    "post_delay": 1500,
-    "next": [
-      "boot_verify_fav2"
-    ],
-    "on_error": [
-      "boot_expand_fav"
-    ]
-  },
-  "boot_verify_fav2": {
-    "recognition": "OCR",
-    "expected": [
-      "选择乐曲"
-    ],
-    "timeout": 10000,
+  "boot_select_fav2": {
+    "recognition": "DirectHit",
+    "action": "Custom",
+    "custom_action": "EnsureFav2Filter",
+    "timeout": 90000,
+    "post_delay": 1000,
     "next": [
       "select_song"
-    ],
-    "interrupt": [
-      "login_expired",
-      "connect_failed"
-    ]
-  },
-  "boot_expand_fav": {
-    "recognition": "OCR",
-    "roi": [
-      0,
-      100,
-      200,
-      620
-    ],
-    "expected": [
-      "^收藏$",
-      "收藏"
-    ],
-    "action": "Click",
-    "timeout": 6000,
-    "post_delay": 1500,
-    "next": [
-      "boot_click_fav2"
-    ],
-    "on_error": [
-      "boot_verify_fav2"
     ]
   },
   "boot_dismiss_ok": {
