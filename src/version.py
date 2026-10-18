@@ -5,4 +5,4 @@ name and ``gui.py`` / ``autodori.py`` read it for the title bar and logs, so
 the version shown in the UI always matches the package that was built.
 """
 
-VERSION = "v0.33"
+VERSION = "v0.34"

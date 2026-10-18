@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import datetime
 import json
 import logging
@@ -76,7 +76,7 @@ MIN_LIVEBOOST = 1
 LIVEMODE = "freelive"
 DIFFICULTY = "hard"
 OFFSET = {"up": 0, "down": 0, "move": 0, "wait": 0.0, "interval": 0.0}
-PHOTOGATE_LATENCY = 30
+PHOTOGATE_LATENCY = 36
 DEFAULT_MOVE_SLICE_SIZE = 10
 MAX_FAILED_TIMES = 10
 CMD_SLICE_SIZE = 100
@@ -147,7 +147,7 @@ def check_song_available(name, id_, difficulty):
 
     # boot_auto plays a fixed number of songs before stopping, so the free-auto
     # strategy limits must not apply: blacklisting a song after N attempts (or
-    # after a non-FC run) would shrink the 收藏2 pool until nothing is left.
+    # after a non-FC run) would shrink the 鏀惰棌2 pool until nothing is left.
     if id_ and LIVEMODE != "boot_auto":
         attempt_count = SONG_ATTEMPT_COUNT_DICT.get(id_, 0)
         if attempt_count >= MAX_ATTEMPT_COUNT:
@@ -181,7 +181,7 @@ class SongRecognition(CustomRecognition):
         elif LIVEMODE == "free_single":
             roi = [220, 545, 570, 30]
         elif LIVEMODE in ["free_auto", "boot_auto"]:
-            # Both modes read the title on the 自由演出 song-select screen.
+            # Both modes read the title on the 鑷敱婕斿嚭 song-select screen.
             roi = [200, 330, 370, 30]
 
         models_to_try = ["ppocr_v5/zh_cn-server",""]
@@ -241,7 +241,7 @@ class SongRecognition(CustomRecognition):
                 if IS_FULL_SONG:
                     matched_song_name = "[FULL] " + matched_song_name
                 elif IS_HIGH_DIFFICULTY:
-                    matched_song_name = "[超高難易度 SPECIAL] " + matched_song_name
+                    matched_song_name = "[瓒呴珮闆ｆ槗搴?SPECIAL] " + matched_song_name
 
             song_id = all_song_name_indexes.get(best_match[0])
 
@@ -559,11 +559,11 @@ class SaveSong(CustomAction):
 @maaresource.custom_action("EnsureFav2Filter")
 class EnsureFav2Filter(CustomAction):
     """
-    Make the song-select screen use the 收藏2 filter.
+    Make the song-select screen use the 鏀惰棌2 filter.
 
-    The left sidebar is a scrollable list of categories: 收藏2 is only visible
-    once the 收藏 group is expanded, and 收藏 itself can sit below the fold
-    (3D演出 / 原创歌曲 / 虚拟歌手 / J-POP ... push it out of view). A fixed
+    The left sidebar is a scrollable list of categories: 鏀惰棌2 is only visible
+    once the 鏀惰棌 group is expanded, and 鏀惰棌 itself can sit below the fold
+    (3D婕斿嚭 / 鍘熷垱姝屾洸 / 铏氭嫙姝屾墜 / J-POP ... push it out of view). A fixed
     pipeline chain cannot express "look, maybe scroll, look again", and doing
     it with error-handling jumps trips MAA's loop detection, so it lives here.
     """
@@ -609,32 +609,32 @@ class EnsureFav2Filter(CustomAction):
         image = self._grab_image()
 
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
-            hit = self._find(context, image, "收藏2")
+            hit = self._find(context, image, "鏀惰棌2")
             if hit:
                 self._click(hit.box)
-                logging.info(f"Song filter: 收藏2 selected (attempt {attempt}).")
+                logging.info(f"Song filter: 鏀惰棌2 selected (attempt {attempt}).")
                 time.sleep(1.0)
                 return CustomAction.RunResult(True)
 
-            hit = self._find(context, image, "^收藏$")
+            hit = self._find(context, image, "^鏀惰棌$")
             if hit:
                 self._click(hit.box)
-                logging.info(f"Song filter: expanded the 收藏 group (attempt {attempt}).")
+                logging.info(f"Song filter: expanded the 鏀惰棌 group (attempt {attempt}).")
                 time.sleep(1.5)
                 image = self._grab_image(image)
-                hit = self._find(context, image, "收藏2")
+                hit = self._find(context, image, "鏀惰棌2")
                 if hit:
                     self._click(hit.box)
-                    logging.info("Song filter: 收藏2 selected after expanding.")
+                    logging.info("Song filter: 鏀惰棌2 selected after expanding.")
                     time.sleep(1.0)
                     return CustomAction.RunResult(True)
 
-            logging.info(f"Song filter: 收藏2 not visible, scrolling the sidebar (attempt {attempt}).")
+            logging.info(f"Song filter: 鏀惰棌2 not visible, scrolling the sidebar (attempt {attempt}).")
             maacontroller.post_swipe(90, 620, 90, 260, 400).wait()
             time.sleep(1.0)
             image = self._grab_image(image)
 
-        logging.warning("Song filter: could not select 收藏2, keeping the current filter.")
+        logging.warning("Song filter: could not select 鏀惰棌2, keeping the current filter.")
         return CustomAction.RunResult(True)
 
 
@@ -679,10 +679,10 @@ def fuzzy_match_song(name):
 def _get_orientation(max_attempts: int = 3):
     """
     0, 1, 2, 3
-    0: 0°
-    1: 90°
-    2: 180°
-    3: 270°
+    0: 0掳
+    1: 90掳
+    2: 180掳
+    3: 270掳
 
     The value decides how android coordinates are rotated onto minitouch's own
     (portrait) coordinate space. Falling back to 0 silently would send every
