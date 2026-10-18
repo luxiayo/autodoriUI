@@ -1,5 +1,6 @@
 import logging
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -14,8 +15,23 @@ import json
 import datetime
 
 
+def _data_path(relative_path) -> Path:
+    """
+    Resolve a data path next to the executable, mirroring autodori.data_path().
+
+    A bare relative path would follow the process working directory instead,
+    so a build launched from another folder would scatter play records.
+    """
+    if getattr(sys, "frozen", False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path(__file__).parent.parent
+    return base_path / relative_path
+
+
 class PlayRecord:
-    _save_path = Path("data/play_records.jsonl")
+    _save_path = _data_path("data/play_records.jsonl")
+
     @classmethod
     def create(cls, **kwargs):
         """

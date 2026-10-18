@@ -42,7 +42,7 @@ if not config_path.exists():
     config_path.write_text("{}", encoding="utf-8")
 
 import numpy as np
-from fuzzywuzzy import process as fzwzprocess
+from fuzzywuzzy import fuzz
 from maa.context import Context
 from maa.controller import AdbController
 from maa.custom_action import CustomAction, CustomRecognitionResult
@@ -63,7 +63,14 @@ import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
 from util import *
+import version
 import cv2
+
+# minitouchpy logs the whole command batch on every publish at INFO level
+# ("send operation: ..."), i.e. several KB of formatting plus GUI log traffic
+# per slice. That cost lands right at the slice boundary, where only a 3 ms
+# margin is left, so keep the package quiet above WARNING.
+logging.getLogger("minitouch.py").setLevel(logging.WARNING)
 
 MIN_LIVEBOOST = 1
 LIVEMODE = "freelive"
@@ -81,6 +88,8 @@ CONFIDENCE_THRESHOLD_FAILURE = 0.8
 CONFIDENCE_THRESHOLD_PLAY = 0.9
 MAX_CONTINUOUS_NOT_FC_COUNT = 1  # A song will be skipped after failing to achieve a Full Combo this many times.
 MAX_ATTEMPT_COUNT = 1  # Maximum number of attempts per song in a single task session
+PLAY_COUNT_TARGET = 9  # boot_auto mode: stop the task after this many completed songs (0 = unlimited)
+PLAY_COMPLETED_COUNT = 0  # boot_auto mode: songs completed in the current task session
 PLAY_FAILED_TIMES = 0
 HUMAN_DELAY_ENABLED = False
 IS_FULL_SONG = False
@@ -112,7 +121,7 @@ callback_data: dict = {}
 callback_data_lock = threading.Lock()
 cmd_log_list: list = []
 cmd_log_list_lock = threading.Lock()
-current_version = None
+current_version = version.VERSION
 stop_event = threading.Event()
 playback_started_event = threading.Event()
 
@@ -136,7 +145,10 @@ def check_song_available(name, id_, difficulty):
     if name.startswith("[FULL]") and not IS_FULL_SONG:
         return False
 
-    if id_:
+    # boot_auto plays a fixed number of songs before stopping, so the free-auto
+    # strategy limits must not apply: blacklisting a song after N attempts (or
+    # after a non-FC run) would shrink the 收藏2 pool until nothing is left.
+    if id_ and LIVEMODE != "boot_auto":
         attempt_count = SONG_ATTEMPT_COUNT_DICT.get(id_, 0)
         if attempt_count >= MAX_ATTEMPT_COUNT:
             logging.warning(f"Song '{name}' has reached max attempt count ({attempt_count}).")
@@ -168,7 +180,8 @@ class SongRecognition(CustomRecognition):
             roi = [110, 545, 370, 30]
         elif LIVEMODE == "free_single":
             roi = [220, 545, 570, 30]
-        elif LIVEMODE == "free_auto":
+        elif LIVEMODE in ["free_auto", "boot_auto"]:
+            # Both modes read the title on the 自由演出 song-select screen.
             roi = [200, 330, 370, 30]
 
         models_to_try = ["ppocr_v5/zh_cn-server",""]
@@ -187,6 +200,9 @@ class SongRecognition(CustomRecognition):
                 ocr_text = context.run_recognition("_ocr_song", argv.image, pipeline).best_result.text
                 logging.info(f"OCR ({model or 'default'}) raw text: '{ocr_text}'")
 
+                if not ocr_text:
+                    return None
+
                 if LIVEMODE not in ["medley_single", "free_single"] and "full" in ocr_text.lower():
                     return 100
 
@@ -194,12 +210,11 @@ class SongRecognition(CustomRecognition):
                 if not match:
                     return None
 
-                matched_name, raw_score = match[0], match[1]
+                matched_name, adjusted_score, raw_score = match
 
                 len_ocr = len(ocr_text)
                 len_matched = len(matched_name)
                 length_ratio = min(len_ocr, len_matched) / max(len_ocr, len_matched) if len_ocr and len_matched else 0
-                adjusted_score = raw_score * length_ratio
 
                 logging.info(
                     f"Adjusted score for '{matched_name}' with length penalty ({model or 'default'}): "
@@ -353,6 +368,7 @@ class SavePlayResult(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
         try:
             global PLAY_FAILED_TIMES, NOT_FC_SONG_COUNT_DICT, LAST_PLAYED_SONG_ID, SONG_ATTEMPT_COUNT_DICT
+            global PLAY_COMPLETED_COUNT
 
             param = argv.custom_action_param
             try:
@@ -372,6 +388,29 @@ class SavePlayResult(CustomAction):
                     bad = playresult.get('bad', -1)
                     miss = playresult.get('miss', -1)
                     maxcombo = playresult.get('maxcombo', -1)
+                    fast = playresult.get('fast', -1)
+                    slow = playresult.get('slow', -1)
+
+                    logging.info(
+                        f"Judgement detail: perfect={perfect} great={great} good={good} "
+                        f"bad={bad} miss={miss} maxcombo={maxcombo} fast={fast} slow={slow}"
+                    )
+                    # FAST/SLOW is the game's own verdict on whether hits landed
+                    # early or late: the only ground truth for the start phase.
+                    if fast >= 0 and slow >= 0 and (fast + slow) > 0:
+                        bias = fast - slow
+                        if bias > 0:
+                            logging.info(
+                                f"Timing bias: fast-slow={bias} (hits tend to be EARLY) "
+                                f"-> raise PHOTOGATE_LATENCY above {PHOTOGATE_LATENCY}"
+                            )
+                        elif bias < 0:
+                            logging.info(
+                                f"Timing bias: fast-slow={bias} (hits tend to be LATE) "
+                                f"-> lower PHOTOGATE_LATENCY below {PHOTOGATE_LATENCY}"
+                            )
+                        else:
+                            logging.info("Timing bias: fast-slow=0 (balanced)")
 
                     is_not_fc = False
                     reasons = []
@@ -387,8 +426,24 @@ class SavePlayResult(CustomAction):
                         is_not_fc = False
                     else:
                         if -1 in [perfect, great, good, bad, miss, maxcombo]:
-                            is_not_fc = True
-                            reasons.append("OCR Failed")
+                            # A single unreadable number must not turn a clean run
+                            # into a failure. When GOOD/BAD/MISS all read as 0 and
+                            # there is at least one PERFECT, the run is an All
+                            # Perfect even if GREAT (0 in that case) failed OCR.
+                            clean = (
+                                perfect > 0
+                                and good == 0
+                                and bad == 0
+                                and miss == 0
+                            )
+                            if clean:
+                                logging.info(
+                                    "Judgement OCR incomplete (great/maxcombo unreadable), "
+                                    "but GOOD/BAD/MISS are all 0 -> treating as All Perfect."
+                                )
+                            else:
+                                is_not_fc = True
+                                reasons.append("OCR Failed")
                         else:
                             if bad > 0:
                                 reasons.append(f"Bad: {bad}")
@@ -424,6 +479,9 @@ class SavePlayResult(CustomAction):
                     logging.info(
                         f"Task successful, resetting continuous failure count from {PLAY_FAILED_TIMES} to zero.")
                 PLAY_FAILED_TIMES = 0
+                PLAY_COMPLETED_COUNT += 1
+                if PLAY_COUNT_TARGET > 0:
+                    logging.info(f"Completed songs: {PLAY_COMPLETED_COUNT}/{PLAY_COUNT_TARGET}")
             else:  # 'not succeed' case
                 # If task failed, increment counter unconditionally
                 PLAY_FAILED_TIMES += 1
@@ -445,6 +503,15 @@ class SavePlayResult(CustomAction):
                     f"Song '{current_song_name}' has been attempted {SONG_ATTEMPT_COUNT_DICT[current_song_id]} times.")
 
             LAST_PLAYED_SONG_ID = current_song_id
+
+            if PLAY_COUNT_TARGET > 0 and PLAY_COMPLETED_COUNT >= PLAY_COUNT_TARGET:
+                logging.info(
+                    f"Reached the target of {PLAY_COUNT_TARGET} completed songs "
+                    f"({PLAY_COMPLETED_COUNT} done). Stopping the task."
+                )
+                context.run_action("close_app")
+                context.run_action("stop")
+                return CustomAction.RunResult(True)
 
             if PLAY_FAILED_TIMES >= MAX_CONTINUOUS_FAILED_TIMES:
                 logging.error(
@@ -489,38 +556,83 @@ class SaveSong(CustomAction):
         return CustomAction.RunResult(True)
 
 
+def _similarity(a: str, b: str) -> int:
+    """Case-insensitive, Unicode-safe similarity (keeps CJK titles intact)."""
+    return fuzz.ratio(a.lower(), b.lower())
+
+
 def fuzzy_match_song(name):
-    return fzwzprocess.extractOne(name, list(all_song_name_indexes.keys()))
+    """
+    Rank every song title by *length-adjusted* similarity and return the best
+    match as (matched_name, adjusted_score, raw_score), or None.
+
+    The length adjustment must happen before the winner is picked. With
+    fuzzywuzzy's default WRatio, a short OCR fragment scores ~90 against a long
+    title through partial matching ('XIST' vs 'Believe in my existence' = 90),
+    which barely beats the correct short title ('XIST' vs 'EXIST' = 89). Picking
+    the raw winner first and shortening the score afterwards therefore throws
+    away the correct answer and only ever ends in a rejection.
+    """
+    if not name:
+        return None
+
+    best = None
+    for candidate in all_song_name_indexes:
+        if not candidate:
+            continue
+
+        raw_score = _similarity(name, candidate)
+        if not raw_score:
+            continue
+
+        length_ratio = min(len(name), len(candidate)) / max(len(name), len(candidate))
+        adjusted_score = raw_score * length_ratio
+
+        if best is None or adjusted_score > best[1]:
+            best = (candidate, adjusted_score, raw_score)
+
+    return best
 
 
-def _get_orientation():
+def _get_orientation(max_attempts: int = 3):
     """
     0, 1, 2, 3
     0: 0°
     1: 90°
     2: 180°
     3: 270°
-    """
-    try:
-        command_list = [
-            str(device.adb_path.absolute()),
-            "-s",
-            device.address,
-            "shell",
-            "dumpsys input|grep SurfaceOrientation",
-        ]
 
-        logging.debug(
-            "get SurfaceOrientation command: {}".format(" ".join(command_list))
-        )
-        output = subprocess.check_output(command_list, text=True)
-        match = re.search(r"SurfaceOrientation:\s*(\d+)", output)
-        orientation = int(match.group(1))
-        logging.debug("SurfaceOrientation: {}".format(orientation))
-        return orientation
-    except Exception as e:
-        logging.error(f"Failed to get SurfaceOrientation: {e}")
-        return 0
+    The value decides how android coordinates are rotated onto minitouch's own
+    (portrait) coordinate space. Falling back to 0 silently would send every
+    touch to the wrong place, so a failure is retried and then raised instead.
+    """
+    command_list = [
+        str(device.adb_path.absolute()),
+        "-s",
+        device.address,
+        "shell",
+        "dumpsys input|grep SurfaceOrientation",
+    ]
+    logging.debug("get SurfaceOrientation command: {}".format(" ".join(command_list)))
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            output = subprocess.check_output(command_list, text=True, timeout=10)
+            match = re.search(r"SurfaceOrientation:\s*(\d+)", output)
+            if match is None:
+                raise RuntimeError(f"pattern not found in output: {output[:200]!r}")
+            orientation = int(match.group(1))
+            logging.debug("SurfaceOrientation: {}".format(orientation))
+            return orientation
+        except Exception as e:
+            logging.warning(
+                f"Failed to get SurfaceOrientation (attempt {attempt}/{max_attempts}): {e}"
+            )
+            time.sleep(0.5 * attempt)
+
+    raise RuntimeError(
+        "Cannot determine device orientation; refusing to play with wrong touch coordinates."
+    )
 
 
 def save_song(name):
@@ -604,24 +716,58 @@ def play_song(stop_event, playback_started_event):
     if not wait_first_note(stop_event):
         return
 
+    slice_count = 0
+    max_underrun_ms = 0.0
+    total_underrun_ms = 0.0
+    max_publish_ms = 0.0
+
     while True:
         if check_exit_status(stop_event):
             return
 
+        publish_start = time.perf_counter()
         current_chart.command_builder.publish(mnt, block=False)
-        wait_time = _get_wait_time()
-        time.sleep(max(0, wait_time - 3) / 1000)
+        max_publish_ms = max(max_publish_ms, (time.perf_counter() - publish_start) * 1000)
 
+        wait_time = _get_wait_time()
+        requested_sleep = max(0, wait_time - 3) / 1000
+
+        sleep_start = time.perf_counter()
+        time.sleep(requested_sleep)
+        sleep_ms = (time.perf_counter() - sleep_start) * 1000
+
+        build_start = time.perf_counter()
         index = current_chart.actions_to_cmd_index
-        if current_chart.actions[index : index + CMD_SLICE_SIZE]:
+        has_more = bool(current_chart.actions[index : index + CMD_SLICE_SIZE])
+        if has_more:
             with callback_data_lock:
                 _adjust_offset()
                 reset_callback_data()
             current_chart.actions_to_MNTcmd(
                 (mnt.max_x, mnt.max_y), current_orientation, OFFSET, CMD_SLICE_SIZE
             )
-        else:
+        build_ms = (time.perf_counter() - build_start) * 1000
+
+        # Time the device sat without new commands: sleep overshoot plus the
+        # time spent compiling the next slice, minus the 3 ms margin the loop
+        # deliberately keeps. Positive values mean the queue ran dry.
+        underrun_ms = (sleep_ms - requested_sleep * 1000) + build_ms - 3
+        max_underrun_ms = max(max_underrun_ms, underrun_ms)
+        total_underrun_ms += underrun_ms
+        slice_count += 1
+
+        if not has_more:
             break
+
+    logging.info(
+        f"Playback stats: slices={slice_count} "
+        f"max_underrun={max_underrun_ms:.1f}ms "
+        f"avg_underrun={total_underrun_ms / max(1, slice_count):.1f}ms "
+        f"max_publish={max_publish_ms:.1f}ms"
+    )
+    logging.info(
+        "Final offsets: " + ", ".join(f"{k}={v:.2f}" for k, v in OFFSET.items())
+    )
 
     time.sleep(2)
     logging.info("Playback finished.")
@@ -634,6 +780,12 @@ def wait_first_note(stop_event):
     from_row, to_row = info["from"], info["to"]
     freezed = False
     playback_start_time = time.time()
+
+    frame_gaps_ms = []
+    last_frame_ts = None
+    frames_after_freeze = 0
+    pre_trigger_max_change = 0.0
+    pre_trigger_frames = 0
 
     while True:
         playback_timeout = 500
@@ -648,21 +800,48 @@ def wait_first_note(stop_event):
             screen = current_player.ipc_capture_display()
             cur_color, _ = get_color_eval_in_range(screen, from_row, to_row)
 
+            now = time.perf_counter()
+            if last_frame_ts is not None:
+                frame_gaps_ms.append((now - last_frame_ts) * 1000)
+            last_frame_ts = now
+            median_gap = float(np.median(frame_gaps_ms)) if frame_gaps_ms else 0.0
+
             if last_color is not None:
                 change_score = np.sum(np.abs(cur_color[:3].astype(int) - last_color[:3].astype(int)))
 
                 if change_score > STABLE_THRESHOLD:
                     if freezed:
-                        logging.info("First note detected, starting playback.")
+                        # This single frame decides the phase of the whole song:
+                        # a mis-timed trigger shifts every note by one frame.
+                        logging.info(
+                            f"First note detected after {frames_after_freeze} frame(s) "
+                            f"(median frame interval {median_gap:.1f}ms, "
+                            f"change={change_score:.1f}); starting playback in {PHOTOGATE_LATENCY}ms."
+                        )
+                        # The band is watched for seconds before the first note.
+                        # If this noise floor creeps close to STABLE_THRESHOLD, a
+                        # stray effect can start the whole song far too early.
+                        logging.info(
+                            f"Pre-trigger band noise: max_change={pre_trigger_max_change:.1f} "
+                            f"over {pre_trigger_frames} frame(s), threshold={STABLE_THRESHOLD}"
+                        )
                         time.sleep(PHOTOGATE_LATENCY / 1000)
                         return True
                 else:
                     if not freezed:
                         waited_frames += 1
+                    else:
+                        frames_after_freeze += 1
+                        pre_trigger_max_change = max(pre_trigger_max_change, change_score)
+                        pre_trigger_frames += 1
 
                 if not freezed and waited_frames >= CONSECUTIVE_FRAMES_NEEDED:
                     freezed = True
-                    logging.info("Screen has frozen. Photogate is ready.")
+                    logging.info(
+                        f"Screen has frozen after {waited_frames} frames "
+                        f"(~{waited_frames * median_gap / 1000:.2f}s, median frame interval {median_gap:.1f}ms). "
+                        "Photogate is ready."
+                    )
 
             last_color = cur_color
             time.sleep(FREEZE_SLEEP_TIME)
@@ -902,12 +1081,107 @@ def monitor_failure_thread(stop_event, playback_started_event):
         logging.info("Monitor thread terminated.")
 
 
+MUMU_MANAGER_RELATIVE_PATH = Path("nx_main") / "MuMuManager.exe"
+
+
+def _find_mumu_install_dir():
+    """Locate MuMu Player's installation directory through the Windows registry."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+
+    uninstall_roots = (
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    )
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for root in uninstall_roots:
+            try:
+                with winreg.OpenKey(hive, root) as key:
+                    for index in range(winreg.QueryInfoKey(key)[0]):
+                        try:
+                            with winreg.OpenKey(key, winreg.EnumKey(key, index)) as entry:
+                                try:
+                                    display_name = str(winreg.QueryValueEx(entry, "DisplayName")[0])
+                                except OSError:
+                                    continue
+                                if "MuMu" not in display_name:
+                                    continue
+                                try:
+                                    location = winreg.QueryValueEx(entry, "InstallLocation")[0]
+                                except OSError:
+                                    continue
+                                candidate = Path(location)
+                                if location and (candidate / MUMU_MANAGER_RELATIVE_PATH).exists():
+                                    return candidate
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    return None
+
+
+def _adb_devices_available():
+    try:
+        return bool(Toolkit.find_adb_devices())
+    except Exception as e:
+        logging.debug(f"find_adb_devices failed: {e}")
+        return False
+
+
+def ensure_emulator_running(timeout: float = 180.0):
+    """
+    Start the MuMu Player instance when no ADB device is reachable yet.
+
+    Only MuMu can be started this way. For LDPlayer the emulator has to be
+    launched by the user, so a missing device is then reported by init_maa().
+    """
+    if _adb_devices_available():
+        logging.info("Emulator already running, skipping launch.")
+        return
+
+    install_dir = _find_mumu_install_dir()
+    if install_dir is None:
+        logging.warning("MuMu Player installation not found; assuming the emulator is started manually.")
+        return
+
+    manager = install_dir / MUMU_MANAGER_RELATIVE_PATH
+    instance_index = str((config or {}).get("emulator", {}).get("mumu_index", 0))
+    logging.info(f"Launching MuMu Player instance {instance_index}: {manager}")
+
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.Popen(
+            [str(manager), "control", "-v", instance_index, "launch"],
+            creationflags=creation_flags,
+        )
+    except OSError as e:
+        logging.error(f"Failed to launch MuMu Player: {e}")
+        return
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(5)
+        if _adb_devices_available():
+            logging.info("Emulator is up and reachable over ADB.")
+            return
+        logging.info("Waiting for the emulator to become reachable over ADB...")
+
+    raise RuntimeError(f"Emulator did not come up within {timeout:.0f}s.")
+
+
 def init():
     global IS_INITIALISED
     if IS_INITIALISED:
         logging.info("Components are already initialised. Skipping.")
         return
     try:
+        logging.info(f"autodoriUI {version.VERSION} initialising.")
+        if LIVEMODE == "boot_auto":
+            ensure_emulator_running()
         init_maa()
         init_player_and_mnt()
         IS_INITIALISED = True
@@ -947,19 +1221,23 @@ def shutdown_resources():
 def run_task_mode():
     global DIFFICULTY, HUMAN_DELAY_ENABLED, LIVEMODE
     global MAX_CONTINUOUS_NOT_FC_COUNT, MAX_ATTEMPT_COUNT, PLAY_FAILED_TIMES, NOT_FC_SONG_COUNT_DICT
+    global PLAY_COMPLETED_COUNT, SONG_ATTEMPT_COUNT_DICT
 
     if not maacontroller or not mnt:
         raise RuntimeError("MAA is not initialised.")
 
     PLAY_FAILED_TIMES = 0
+    PLAY_COMPLETED_COUNT = 0
     NOT_FC_SONG_COUNT_DICT.clear()
+    SONG_ATTEMPT_COUNT_DICT.clear()  # MAX_ATTEMPT_COUNT is documented as per task session
 
     mode_configs = {
         "free_single": ("Single", "ui_simplified_entry", ["single.json"]),
         "medley_single": ("Medley", "ui_simplified_entry", ["single.json"]),
         "story": ("story", "read_story", ["story.json"]),
         "rouge": ("rouge", "start_from_main_menu", ["rouge.json"]),
-        "free_auto": ("Auto", "select_song", ["full_auto.json"])
+        "free_auto": ("Auto", "select_song", ["full_auto.json"]),
+        "boot_auto": ("Boot Auto", "boot_launch", ["full_auto.json", "boot_auto.json"]),
     }
 
     if LIVEMODE not in mode_configs:

@@ -15,6 +15,7 @@ from tkinter import ttk
 
 import resource
 import autodori
+import version
 
 
 # --- 关键部分：设置日志重定向 ---
@@ -39,7 +40,7 @@ class FilteringFileHandler(logging.FileHandler):
 class AutodoriGUI:
     def __init__(self, master):
         self.master = master
-        master.title("autodoriUI")
+        master.title(f"autodoriUI {version.VERSION}")
         master.geometry("700x550")
 
         self.bot_thread = None
@@ -52,6 +53,7 @@ class AutodoriGUI:
         self.human_var = tk.BooleanVar(value=autodori.HUMAN_DELAY_ENABLED)
         self.max_continuous_not_fc_var = tk.IntVar(value=autodori.MAX_CONTINUOUS_NOT_FC_COUNT)
         self.max_attempt_var = tk.IntVar(value=autodori.MAX_ATTEMPT_COUNT)
+        self.play_count_var = tk.IntVar(value=autodori.PLAY_COUNT_TARGET)
         self.disclaimer_agreed_var = tk.BooleanVar(value=False)
 
         self.config_path = autodori.config_path  # 直接使用后端的 Path 对象
@@ -80,6 +82,7 @@ class AutodoriGUI:
         self.human_var.trace_add('write', self._auto_save_callback)
         self.max_continuous_not_fc_var.trace_add('write', self._auto_save_callback)
         self.max_attempt_var.trace_add('write', self._auto_save_callback)
+        self.play_count_var.trace_add('write', self._auto_save_callback)
 
         # --- 设置日志队列 (用于GUI显示) ---
         self.log_queue = queue.Queue()
@@ -178,6 +181,9 @@ class AutodoriGUI:
                                          command=self._show_main_app)
         self.proceed_button.pack(fill=tk.X, padx=100, ipady=5)
 
+        ttk.Label(self.disclaimer_frame, text=f"版本 {version.VERSION}",
+                  foreground="gray").pack(pady=(10, 0))
+
         # 步骤3：将事件处理函数绑定到容器的 <Configure> 事件
         self.disclaimer_frame.bind("<Configure>", self._on_disclaimer_resize)
 
@@ -265,6 +271,8 @@ class AutodoriGUI:
         exit_app_button = ttk.Button(button_frame, text="退出", command=self.master.destroy)
         exit_app_button.pack(side=tk.LEFT, padx=1)
 
+        ttk.Label(button_frame, text=version.VERSION, foreground="gray").pack(side=tk.RIGHT, padx=(4, 2))
+
         # 3. 日志显示：减小默认尺寸
         # height=5, width=30 减少日志区域的最小尺寸
         LOG_FONT = ("Cascadia Mono", 8)  # 或 ("Arial", 10), ("Courier New", 7) 等
@@ -334,7 +342,7 @@ class AutodoriGUI:
         style = ttk.Style()
         style.configure("Warning.TLabel", foreground="red")
 
-        config_frame = ttk.LabelFrame(top_frame, text="配置")
+        config_frame = ttk.LabelFrame(top_frame, text=f"配置  ·  autodoriUI {version.VERSION}")
         config_frame.pack(fill=tk.X, expand=True, side=tk.TOP, pady=(0, 5))
 
         mode_frame = ttk.Frame(config_frame)
@@ -345,6 +353,16 @@ class AutodoriGUI:
         ttk.Radiobutton(mode_frame, text="巡回演出——单曲模式", variable=self.mode_var, value='medley_single', command=self._on_mode_change).pack(side=tk.LEFT, padx=5)
         #ttk.Radiobutton(mode_frame, text="story", variable=self.mode_var, value='story', command=self._on_mode_change).pack(side=tk.LEFT, padx=5)
         #ttk.Radiobutton(mode_frame, text="rouge", variable=self.mode_var, value='rouge', command=self._on_mode_change).pack(side=tk.LEFT, padx=5)
+
+        # 第二行：全自动一轮（开机引导 + 指定完成次数）
+        mode_frame2 = ttk.Frame(config_frame)
+        mode_frame2.pack(fill=tk.X, padx=2, pady=2)
+        ttk.Radiobutton(mode_frame2, text="全自动一轮（启动模拟器→登录→跑满次数）", variable=self.mode_var,
+                        value='boot_auto', command=self._on_mode_change).pack(side=tk.LEFT, padx=5)
+        self.play_count_frame = ttk.Frame(mode_frame2)
+        ttk.Label(self.play_count_frame, text="完成次数：").pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Spinbox(self.play_count_frame, from_=1, to=99, textvariable=self.play_count_var, width=5).pack(
+            side=tk.LEFT, padx=3)
 
         warnings_frame = ttk.Frame(mode_frame)
         warnings_frame.pack(side=tk.RIGHT, padx=(10, 0))
@@ -401,7 +419,7 @@ class AutodoriGUI:
 
     # --- 新增方法：用于根据模式动态显示/隐藏UI控件 ---
     def _on_mode_change(self):
-        """当模式（单曲/全自动）切换时，动态显示或隐藏相关配置项。"""
+        """当模式（单曲/全自动/全自动一轮）切换时，动态显示或隐藏相关配置项。"""
         mode = self.mode_var.get()
         if mode == 'free_auto':
             # 在全自动模式下：显示FC相关设置
@@ -409,6 +427,11 @@ class AutodoriGUI:
         else:
             # 在单曲模式下：隐藏FC相关设置
             self.fc_options_frame.pack_forget()
+
+        if mode == 'boot_auto':
+            self.play_count_frame.pack(side=tk.LEFT, padx=5)
+        else:
+            self.play_count_frame.pack_forget()
 
     def _create_globals_tab(self, parent_frame):
         """填充“全局变量调试”选项卡的内容"""
@@ -547,6 +570,7 @@ class AutodoriGUI:
                 if "max_continuous_not_fc_count" in config: self.max_continuous_not_fc_var.set(
                     config["max_continuous_not_fc_count"])
                 if "max_attempt_count" in config: self.max_attempt_var.set(config["max_attempt_count"])
+                if "play_count" in config: self.play_count_var.set(config["play_count"])
                 if "disclaimer_agreed" in config: self.disclaimer_agreed_var.set(config["disclaimer_agreed"])
                 # 覆盖后端的全局变量
                 if "globals" in config:
@@ -580,6 +604,7 @@ class AutodoriGUI:
             "human_delay": self.human_var.get(),
             "max_continuous_not_fc_count": self.max_continuous_not_fc_var.get(),
             "max_attempt_count": self.max_attempt_var.get(),
+            "play_count": self.play_count_var.get(),
             "disclaimer_agreed": self.disclaimer_agreed_var.get(),  # 新增：保存免责声明状态
             "globals": globals_to_save
         })
@@ -663,6 +688,10 @@ class AutodoriGUI:
         autodori.HUMAN_DELAY_ENABLED = self.human_var.get()
         autodori.MAX_CONTINUOUS_NOT_FC_COUNT = self.max_continuous_not_fc_var.get()
         autodori.MAX_ATTEMPT_COUNT = self.max_attempt_var.get()
+        # 只有“全自动一轮”受完成次数约束，其它模式保持无限循环
+        autodori.PLAY_COUNT_TARGET = (
+            self.play_count_var.get() if self.mode_var.get() == 'boot_auto' else 0
+        )
 
         self.bot_thread = threading.Thread(target=self._run_bot_task, daemon=True)
         self.bot_thread.start()

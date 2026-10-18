@@ -28,8 +28,102 @@
     "action": "Custom",
     "custom_action": "Play",
     "next": [
-      "stop"
+      "single_wait_result"
     ],
     "timeout": 500000
+  },
+  "single_wait_result": {
+    "recognition": "TemplateMatch",
+    "template": [
+      "live/scored.png",
+      "live/activity_scored.png"
+    ],
+    "pre_wait_freezes": {
+      "threshold": 0.65,
+      "time": 5000
+    },
+    "timeout": 120000,
+    "next": [
+      "single_wait_playresult"
+    ],
+    "interrupt": [
+      "single_live_failed",
+      "single_ok_button",
+      "single_confirm_button",
+      "single_close_button"
+    ]
+  },
+  "single_wait_playresult": {
+    "recognition": "TemplateMatch",
+    "template": [
+      "live/scored.png",
+      "live/activity_scored.png"
+    ],
+    "pre_wait_freezes": 2000,
+    "timeout": 30000,
+    "next": [
+      "single_save_result"
+    ]
+  },
+  "single_save_result": {
+    "recognition": "Custom",
+    "custom_recognition": "PlayResultRecognition",
+    "action": "Custom",
+    "custom_action": "SavePlayResult",
+    "custom_action_param": {
+      "succeed": true
+    },
+    "timeout": 30000,
+    "next": [
+      "stop"
+    ]
+  },
+  "single_live_failed": {
+    "recognition": "OCR",
+    "expected": "演出失败",
+    "roi": [
+      256,
+      227,
+      155,
+      38
+    ],
+    "timeout": 5000,
+    "next": [
+      "single_save_failed"
+    ]
+  },
+  "single_save_failed": {
+    "action": "Custom",
+    "custom_action": "SavePlayResult",
+    "custom_action_param": {
+      "succeed": false
+    },
+    "next": [
+      "stop"
+    ]
+  },
+  "single_ok_button": {
+    "recognition": "TemplateMatch",
+    "template": "common/button/ok/white.png",
+    "action": "Click",
+    "post_delay": 1500
+  },
+  "single_confirm_button": {
+    "recognition": "TemplateMatch",
+    "template": [
+      "common/button/confirm/pink.png",
+      "common/button/confirm/white.png"
+    ],
+    "action": "Click",
+    "post_delay": 1500
+  },
+  "single_close_button": {
+    "recognition": "TemplateMatch",
+    "template": [
+      "common/button/close/white.png",
+      "common/button/exit/white.png"
+    ],
+    "action": "Click",
+    "post_delay": 1500
   }
 }

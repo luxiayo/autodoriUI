@@ -1,6 +1,7 @@
 import os
 import sys
 import shutil
+import filecmp
 import requests
 from io import BytesIO
 from zipfile import ZipFile
@@ -24,7 +25,14 @@ def get_meipass_dir():
 
 
 def release_bundled_assets(progress_callback=None):
-    """初次启动时，将内置的轻量级资源释放到 exe 同级目录"""
+    """
+    将内置的轻量级资源释放到 exe 同级目录。
+
+    不能只在目标目录不存在时才复制：升级 exe 后，旧的 assets 目录会留在原地，
+    新版本新增或修改的 pipeline / image 资源就永远落不了地（表现为
+    "Cannot find required Pipeline configuration file: .../boot_auto.json"）。
+    这里改为逐个文件比对，内容不同就覆盖，保证运行中的资源始终与 exe 一致。
+    """
     base_dir = get_base_dir()
     meipass_dir = get_meipass_dir()
 
@@ -40,15 +48,28 @@ def release_bundled_assets(progress_callback=None):
         # 源路径（隐藏在临时文件夹中的内置文件）
         source_path = os.path.join(meipass_dir, rel_path)
 
-        # 如果目标路径不存在，且临时目录里确实打包了这个文件夹，则执行复制
-        if not os.path.exists(target_path) and os.path.exists(source_path):
-            if progress_callback:
-                progress_callback(f"正在释放内置资源: {os.path.basename(rel_path)}...", -1)
+        if not os.path.exists(source_path):
+            continue
 
-            # 创建父级目录并复制整个文件夹
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            shutil.copytree(source_path, target_path, dirs_exist_ok=True)
-            print(f"✅ 内置资源已释放至: {target_path}")
+        if progress_callback:
+            progress_callback(f"正在释放内置资源: {os.path.basename(rel_path)}...", -1)
+
+        released = 0
+        for root, _, files in os.walk(source_path):
+            rel_root = os.path.relpath(root, source_path)
+            dest_root = target_path if rel_root == "." else os.path.join(target_path, rel_root)
+            os.makedirs(dest_root, exist_ok=True)
+
+            for name in files:
+                source_file = os.path.join(root, name)
+                dest_file = os.path.join(dest_root, name)
+                if os.path.exists(dest_file) and filecmp.cmp(source_file, dest_file, shallow=False):
+                    continue
+                shutil.copy2(source_file, dest_file)
+                released += 1
+
+        if released:
+            print(f"✅ 内置资源已同步 {released} 个文件至: {target_path}")
 
 def download_and_extract(url, extract_to_path, progress_callback=None, desc="下载中"):
     """
