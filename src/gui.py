@@ -683,6 +683,9 @@ class AutodoriGUI:
 
     def start_bot(self):
         self.save_settings()
+        # A stop from the previous run leaves the event set; clear it or the new
+        # startup path (emulator launch, controller connect) aborts immediately.
+        autodori.stop_event.clear()
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self._update_float_button_state()
@@ -725,7 +728,10 @@ class AutodoriGUI:
 
             logging.info("Task completed.")
         except Exception as e:
-            logging.error(f"Exception: {e}", exc_info=True)
+            if autodori.stop_event.is_set():
+                logging.info("Task cancelled by user.")
+            else:
+                logging.error(f"Exception: {e}", exc_info=True)
         finally:
             self.start_button.config(state=tk.NORMAL)
             self.stop_button.config(state=tk.DISABLED)

@@ -704,7 +704,9 @@ def _get_orientation(max_attempts: int = 3):
 
     for attempt in range(1, max_attempts + 1):
         try:
-            output = subprocess.check_output(command_list, text=True, timeout=10)
+            output = subprocess.check_output(
+                command_list, encoding="utf-8", errors="replace", timeout=10
+            )
             match = re.search(r"SurfaceOrientation:\s*(\d+)", output)
             if match is None:
                 raise RuntimeError(f"pattern not found in output: {output[:200]!r}")
@@ -1019,6 +1021,8 @@ def init_maa():
         if maacontroller.post_connection().wait().succeeded:
             is_connected = True
             break
+        if stop_event.is_set():
+            raise RuntimeError("Cancelled while connecting to the emulator.")
         logging.info(f"Connecting to the controller failed, retrying ({attempt}/12)...")
         time.sleep(5)
 
@@ -1248,7 +1252,8 @@ def _adb_shell_ready(device) -> bool:
     try:
         output = subprocess.check_output(
             [str(device.adb_path.absolute()), "-s", device.address, "shell", "echo", "ok"],
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             stderr=subprocess.DEVNULL,
         )
@@ -1258,49 +1263,147 @@ def _adb_shell_ready(device) -> bool:
     return "ok" in output
 
 
-def ensure_emulator_running(timeout: float = 240.0):
+def _mumu_instance_state(manager, instance_index):
+    """
+    Return the MuMu instance state, or None when it cannot be read.
+
+    Keys: process (the VM runs), android (Android finished booting),
+    host / port (its adb endpoint).
+    """
+    if manager is None:
+        return None
+    try:
+        output = subprocess.check_output(
+            [str(manager), "info", "-v", str(instance_index)],
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            stderr=subprocess.DEVNULL,
+        )
+        data = json.loads(output)
+    except Exception as e:
+        logging.debug(f"MuMuManager info failed: {e}")
+        return None
+
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        return None
+    return {
+        "process": bool(data.get("is_process_started")),
+        "android": bool(data.get("is_android_started")),
+        "host": data.get("adb_host_ip") or "127.0.0.1",
+        "port": data.get("adb_port"),
+    }
+
+
+def _launch_mumu(manager, instance_index) -> bool:
+    logging.info(f"Launching MuMu Player instance {instance_index}: {manager}")
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.Popen(
+            [str(manager), "control", "-v", str(instance_index), "launch"],
+            creationflags=creation_flags,
+        )
+        return True
+    except OSError as e:
+        logging.error(f"Failed to launch MuMu Player: {e}")
+        return False
+
+
+def ensure_emulator_running(timeout: float = 180.0):
     """
     Start the MuMu Player instance when it is not usable yet, and wait until
     Android is actually booted (not merely listed by adb).
 
+    The wait is cancellable: pressing stop sets stop_event and aborts startup
+    within a couple of seconds instead of burning through the whole timeout.
+    A launch that silently does nothing is retried once a minute, and the
+    current VM state is reported every 10 s so a stuck boot is visible.
+
     Only MuMu can be started this way. For LDPlayer the emulator has to be
     launched by the user, so a missing device is then reported by init_maa().
     """
+    instance_index = str((config or {}).get("emulator", {}).get("mumu_index", 0))
+
     device = _first_adb_device()
     if device is not None and _adb_shell_ready(device):
         logging.info("Emulator already running and reachable over ADB.")
         return
 
-    if device is None:
-        install_dir = _find_mumu_install_dir()
-        if install_dir is None:
-            logging.warning("MuMu Player installation not found; assuming the emulator is started manually.")
-            return
+    install_dir = _find_mumu_install_dir()
+    manager = (install_dir / MUMU_MANAGER_RELATIVE_PATH) if install_dir else None
+    adb_path = (install_dir / "nx_main" / "adb.exe") if install_dir else None
 
-        manager = install_dir / MUMU_MANAGER_RELATIVE_PATH
-        instance_index = str((config or {}).get("emulator", {}).get("mumu_index", 0))
-        logging.info(f"Launching MuMu Player instance {instance_index}: {manager}")
+    state = _mumu_instance_state(manager, instance_index)
+    vm_running = bool(state and state["process"])
 
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        try:
-            subprocess.Popen(
-                [str(manager), "control", "-v", instance_index, "launch"],
-                creationflags=creation_flags,
-            )
-        except OSError as e:
-            logging.error(f"Failed to launch MuMu Player: {e}")
-            return
-    else:
-        logging.info("Emulator process is running but adb is not usable yet, waiting for boot.")
+    if vm_running:
+        # Android may well be up already; adb just has not been told about it.
+        logging.info("Emulator is already running; making sure adb can reach it.")
+    elif manager is None:
+        logging.warning("MuMu Player installation not found; assuming the emulator is started manually.")
+        return
+    elif not _launch_mumu(manager, instance_index):
+        return
 
-    deadline = time.time() + timeout
+    started = time.time()
+    deadline = started + timeout
+    last_report = 0.0
+    last_connect = 0.0
+    next_relaunch = started + 60
+
     while time.time() < deadline:
-        time.sleep(2)
+        if stop_event.is_set():
+            logging.warning("Stop requested while waiting for the emulator; aborting startup.")
+            raise RuntimeError("Cancelled while waiting for the emulator to boot.")
+
         device = _first_adb_device()
         if device is not None and _adb_shell_ready(device):
-            logging.info(f"Emulator is up and reachable over ADB ({device.address}).")
+            logging.info(
+                f"Emulator is up and reachable over ADB ({device.address}) "
+                f"after {time.time() - started:.0f}s."
+            )
             return
-        logging.info("Waiting for the emulator to finish booting...")
+
+        now = time.time()
+        state = _mumu_instance_state(manager, instance_index)
+        vm_running = bool(state and state["process"])
+
+        # adb does not always discover the emulator on its own, especially once
+        # the adb server has been restarted. Connecting explicitly is what makes
+        # a booted-but-invisible instance usable.
+        if adb_path is not None and adb_path.exists() and state and state.get("port"):
+            if now - last_connect >= 5:
+                last_connect = now
+                endpoint = f"{state['host']}:{state['port']}"
+                try:
+                    subprocess.run(
+                        [str(adb_path), "connect", endpoint],
+                        encoding="utf-8", errors="replace", timeout=15,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    logging.debug(f"adb connect {endpoint} attempted")
+                except Exception as e:
+                    logging.debug(f"adb connect {endpoint} failed: {e}")
+
+        if now - last_report >= 10:
+            last_report = now
+            detail = f"{device.address} (adb offline)" if device else "no adb device"
+            if state is not None:
+                detail += f", vm running={state['process']}, android booted={state['android']}"
+            logging.info(
+                f"Waiting for the emulator to finish booting... [{detail}, {now - started:.0f}s]"
+            )
+
+        # MuMu occasionally swallows the launch silently; retry while the VM is down.
+        if manager is not None and now >= next_relaunch:
+            next_relaunch = now + 60
+            if state is not None and not vm_running:
+                logging.warning("MuMu instance is not running; launching it again.")
+                _launch_mumu(manager, instance_index)
+
+        time.sleep(2)
 
     raise RuntimeError(f"Emulator did not become usable within {timeout:.0f}s.")
 
