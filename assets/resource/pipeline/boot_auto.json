@@ -11,6 +11,7 @@
       "boot_tap_title_img",
       "boot_tap_title",
       "next_button",
+      "boot_back_to_main",
       "boot_dismiss_ok",
       "boot_dismiss_confirm",
       "boot_dismiss_close",
@@ -37,6 +38,7 @@
       "boot_tap_title_img",
       "boot_tap_title",
       "next_button",
+      "boot_back_to_main",
       "boot_open_menu",
       "boot_dismiss_ok",
       "boot_dismiss_confirm",
@@ -44,6 +46,30 @@
       "login_expired",
       "connect_failed"
     ]
+  },
+  "boot_back_to_main": {
+    "recognition": "OCR",
+    "roi": [
+      60,
+      5,
+      430,
+      92
+    ],
+    "expected": [
+      "选择乐队",
+      "选择乐曲",
+      "选择演出",
+      "选择难度",
+      "演出设定"
+    ],
+    "action": "Click",
+    "target": [
+      22,
+      26,
+      92,
+      62
+    ],
+    "post_delay": 1800
   },
   "boot_tap_title_img": {
     "recognition": "TemplateMatch",
