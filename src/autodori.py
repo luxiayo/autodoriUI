@@ -90,6 +90,7 @@ MAX_CONTINUOUS_NOT_FC_COUNT = 1  # A song will be skipped after failing to achie
 MAX_ATTEMPT_COUNT = 1  # Maximum number of attempts per song in a single task session
 PLAY_COUNT_TARGET = 9  # boot_auto mode: stop the task after this many completed songs (0 = unlimited)
 PLAY_COMPLETED_COUNT = 0  # boot_auto mode: songs completed in the current task session
+RECOVER_COUNT = 0  # consecutive times the post-live loop had to re-enter the navigation chain
 PLAY_FAILED_TIMES = 0
 HUMAN_DELAY_ENABLED = False
 # Verbose timing instrumentation: per-slice underrun lines and the raw minitouch
@@ -373,7 +374,7 @@ class SavePlayResult(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
         try:
             global PLAY_FAILED_TIMES, NOT_FC_SONG_COUNT_DICT, LAST_PLAYED_SONG_ID, SONG_ATTEMPT_COUNT_DICT
-            global PLAY_COMPLETED_COUNT
+            global PLAY_COMPLETED_COUNT, RECOVER_COUNT
 
             param = argv.custom_action_param
             try:
@@ -485,6 +486,8 @@ class SavePlayResult(CustomAction):
                         f"Task successful, resetting continuous failure count from {PLAY_FAILED_TIMES} to zero.")
                 PLAY_FAILED_TIMES = 0
                 PLAY_COMPLETED_COUNT += 1
+                # A finished song means the loop is healthy again.
+                RECOVER_COUNT = 0
                 if PLAY_COUNT_TARGET > 0:
                     logging.info(f"Completed songs: {PLAY_COMPLETED_COUNT}/{PLAY_COUNT_TARGET}")
             else:  # 'not succeed' case
@@ -559,6 +562,34 @@ class SaveSong(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
         name: CustomRecognitionResult = argv.reco_detail.best_result.detail
         save_song(name)
+        return CustomAction.RunResult(True)
+
+
+@maaresource.custom_action("RecoverAfterSong")
+class RecoverAfterSong(CustomAction):
+    """
+    Fallback for when the post-live 再来一次 button never appears.
+
+    A live sometimes drops straight back to the main page instead of showing the
+    result screen (for example when a story scene follows it), so liveagain never
+    matches and the loop used to give up and stop the whole session. Re-enter the
+    navigation chain instead, giving up only after several tries in a row so a
+    genuinely stuck game cannot loop forever.
+    """
+
+    MAX_RECOVERIES = 5
+
+    def run(self, context: Context, argv: CustomAction.RunArg):
+        global RECOVER_COUNT
+        RECOVER_COUNT += 1
+        logging.warning(
+            f"再来一次 was not found; re-entering the navigation chain "
+            f"({RECOVER_COUNT}/{self.MAX_RECOVERIES})."
+        )
+        if RECOVER_COUNT >= self.MAX_RECOVERIES:
+            logging.error("Too many recoveries without finishing a song; stopping the task.")
+            RECOVER_COUNT = 0
+            context.run_action("stop")
         return CustomAction.RunResult(True)
 
 
@@ -1463,13 +1494,14 @@ def shutdown_resources():
 def run_task_mode():
     global DIFFICULTY, HUMAN_DELAY_ENABLED, LIVEMODE
     global MAX_CONTINUOUS_NOT_FC_COUNT, MAX_ATTEMPT_COUNT, PLAY_FAILED_TIMES, NOT_FC_SONG_COUNT_DICT
-    global PLAY_COMPLETED_COUNT, SONG_ATTEMPT_COUNT_DICT
+    global PLAY_COMPLETED_COUNT, RECOVER_COUNT, SONG_ATTEMPT_COUNT_DICT
 
     if not maacontroller or not mnt:
         raise RuntimeError("MAA is not initialised.")
 
     PLAY_FAILED_TIMES = 0
     PLAY_COMPLETED_COUNT = 0
+    RECOVER_COUNT = 0
     NOT_FC_SONG_COUNT_DICT.clear()
     SONG_ATTEMPT_COUNT_DICT.clear()  # MAX_ATTEMPT_COUNT is documented as per task session
 

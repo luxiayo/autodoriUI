@@ -237,7 +237,7 @@
     ],
     "timeout": 30000,
     "on_error": [
-      "stop"
+      "recover_to_main"
     ],
     "interrupt": [
       "next_button",
@@ -246,6 +246,13 @@
       "confirm_button",
       "reader_menu",
       "read_after"
+    ]
+  },
+  "recover_to_main": {
+    "action": "Custom",
+    "custom_action": "RecoverAfterSong",
+    "next": [
+      "boot_launch"
     ]
   },
   "liveagain": {
