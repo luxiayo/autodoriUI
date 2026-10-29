@@ -14,3 +14,4 @@ playhouse
 peewee
 pillow
 pyinstaller
+pystray

@@ -1,3 +1,4 @@
+import datetime
 import logging
 import os
 import queue
@@ -56,6 +57,8 @@ class AutodoriGUI:
         self.max_continuous_not_fc_var = tk.IntVar(value=autodori.MAX_CONTINUOUS_NOT_FC_COUNT)
         self.max_attempt_var = tk.IntVar(value=autodori.MAX_ATTEMPT_COUNT)
         self.play_count_var = tk.IntVar(value=autodori.PLAY_COUNT_TARGET)
+        # [{"time": "07:00", "count": 9, "enabled": True, "last_date": None}]
+        self.schedule_entries = []
         self.disclaimer_agreed_var = tk.BooleanVar(value=False)
 
         self.config_path = autodori.config_path  # 直接使用后端的 Path 对象
@@ -131,6 +134,10 @@ class AutodoriGUI:
         else:
             # 否则，按原计划显示免责声明界面
             self._create_disclaimer_view()
+
+        # 托盘常驻 + 定时任务循环（关窗后依然生效）
+        self._init_tray()
+        self.master.after(20000, self._schedule_tick)
 
     def _create_disclaimer_view(self):
         """创建并显示欢迎/风险提示界面。"""
@@ -333,6 +340,11 @@ class AutodoriGUI:
         globals_frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(globals_frame, text='全局变量调试')
         self._create_globals_tab(globals_frame)
+
+        # --- 创建第三个选项卡：定时任务 ---
+        schedule_frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(schedule_frame, text='定时任务')
+        self._create_schedule_tab(schedule_frame)
 
     def _create_control_panel_tab(self, parent_frame):
         """填充“控制面板”选项卡的内容"""
@@ -577,6 +589,19 @@ class AutodoriGUI:
                 if "max_attempt_count" in config: self.max_attempt_var.set(config["max_attempt_count"])
                 if "play_count" in config: self.play_count_var.set(config["play_count"])
                 if "disclaimer_agreed" in config: self.disclaimer_agreed_var.set(config["disclaimer_agreed"])
+                # 定时任务列表
+                entries = config.get("schedule")
+                if isinstance(entries, list):
+                    self.schedule_entries = [
+                        {
+                            "time": str(e.get("time", "07:00")),
+                            "count": int(e.get("count", 9)),
+                            "enabled": bool(e.get("enabled", True)),
+                            "last_date": e.get("last_date"),
+                        }
+                        for e in entries
+                        if isinstance(e, dict)
+                    ]
                 # 覆盖后端的全局变量
                 if "globals" in config:
                     for k, v in config["globals"].items():
@@ -611,6 +636,7 @@ class AutodoriGUI:
             "max_attempt_count": self.max_attempt_var.get(),
             "play_count": self.play_count_var.get(),
             "disclaimer_agreed": self.disclaimer_agreed_var.get(),  # 新增：保存免责声明状态
+            "schedule": self.schedule_entries,
             "globals": globals_to_save
         })
 
@@ -760,6 +786,214 @@ class AutodoriGUI:
         """拦截并阻止PanedWindow的尺寸调整事件。"""
         return "break"
 
+    # ---------------- 定时任务 + 系统托盘 ----------------
+    def _create_schedule_tab(self, parent_frame):
+        """每天在指定时间自动跑一次「全自动一轮」的任务列表。"""
+        ttk.Label(
+            parent_frame,
+            text="到达设定时间会自动切换到「全自动一轮」并按设定次数运行。\n"
+                 "窗口可以关掉——程序会留在系统托盘里继续计时。",
+            justify=tk.LEFT, foreground="gray",
+        ).pack(anchor='w', pady=(0, 8))
+
+        columns = ("time", "count", "enabled", "last")
+        self.schedule_tree = ttk.Treeview(parent_frame, columns=columns, show="headings", height=8)
+        for col, title, width in (
+            ("time", "时间", 90),
+            ("count", "完成次数", 90),
+            ("enabled", "启用", 60),
+            ("last", "上次运行", 170),
+        ):
+            self.schedule_tree.heading(col, text=title)
+            self.schedule_tree.column(col, width=width, anchor='center')
+        self.schedule_tree.pack(fill=tk.BOTH, expand=True)
+
+        edit_frame = ttk.LabelFrame(parent_frame, text="编辑")
+        edit_frame.pack(fill=tk.X, pady=(8, 0))
+
+        row = ttk.Frame(edit_frame)
+        row.pack(fill=tk.X, padx=4, pady=4)
+        ttk.Label(row, text="时间:").pack(side=tk.LEFT)
+        self.schedule_time_var = tk.StringVar(value="07:00")
+        ttk.Entry(row, textvariable=self.schedule_time_var, width=8).pack(side=tk.LEFT, padx=(2, 12))
+        ttk.Label(row, text="完成次数:").pack(side=tk.LEFT)
+        self.schedule_count_var = tk.IntVar(value=9)
+        ttk.Spinbox(row, from_=1, to=99, textvariable=self.schedule_count_var, width=5).pack(side=tk.LEFT, padx=(2, 12))
+        self.schedule_enabled_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="启用", variable=self.schedule_enabled_var).pack(side=tk.LEFT)
+
+        btn_row = ttk.Frame(edit_frame)
+        btn_row.pack(fill=tk.X, padx=4, pady=(0, 4))
+        ttk.Button(btn_row, text="添加", command=self._add_schedule_entry).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="更新选中", command=self._update_schedule_entry).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="删除选中", command=self._remove_schedule_entry).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="载入选中", command=self._load_schedule_entry).pack(side=tk.LEFT, padx=2)
+
+        self._refresh_schedule_tree()
+
+    def _refresh_schedule_tree(self):
+        if not hasattr(self, "schedule_tree"):
+            return
+        self.schedule_tree.delete(*self.schedule_tree.get_children())
+        for idx, entry in enumerate(self.schedule_entries):
+            self.schedule_tree.insert(
+                "", tk.END, iid=str(idx),
+                values=(
+                    entry.get("time", "07:00"),
+                    entry.get("count", 9),
+                    "是" if entry.get("enabled", True) else "否",
+                    entry.get("last_date") or "-",
+                ),
+            )
+
+    def _selected_schedule_index(self):
+        sel = self.schedule_tree.selection()
+        return int(sel[0]) if sel else None
+
+    def _read_schedule_form(self):
+        text = self.schedule_time_var.get().strip()
+        try:
+            datetime.datetime.strptime(text, "%H:%M")
+        except ValueError:
+            messagebox.showerror("输入错误", f"时间格式应为 HH:MM，例如 07:00（当前：{text}）")
+            return None
+        return {
+            "time": text,
+            "count": max(1, min(99, int(self.schedule_count_var.get()))),
+            "enabled": bool(self.schedule_enabled_var.get()),
+            "last_date": None,
+        }
+
+    def _add_schedule_entry(self):
+        entry = self._read_schedule_form()
+        if entry is None:
+            return
+        for existing in self.schedule_entries:
+            if existing.get("time") == entry["time"]:
+                messagebox.showinfo("提示", f"已经有一条 {entry['time']} 的定时任务了。")
+                return
+        self.schedule_entries.append(entry)
+        self.schedule_entries.sort(key=lambda e: e.get("time", ""))
+        self._refresh_schedule_tree()
+        self.save_settings()
+        logging.info(f"Schedule: added {entry['time']} x{entry['count']}.")
+
+    def _update_schedule_entry(self):
+        idx = self._selected_schedule_index()
+        if idx is None:
+            messagebox.showinfo("提示", "请先在列表里选中一条。")
+            return
+        entry = self._read_schedule_form()
+        if entry is None:
+            return
+        entry["last_date"] = self.schedule_entries[idx].get("last_date")
+        self.schedule_entries[idx] = entry
+        self.schedule_entries.sort(key=lambda e: e.get("time", ""))
+        self._refresh_schedule_tree()
+        self.save_settings()
+
+    def _remove_schedule_entry(self):
+        idx = self._selected_schedule_index()
+        if idx is None:
+            messagebox.showinfo("提示", "请先在列表里选中一条。")
+            return
+        removed = self.schedule_entries.pop(idx)
+        self._refresh_schedule_tree()
+        self.save_settings()
+        logging.info(f"Schedule: removed {removed.get('time')}.")
+
+    def _load_schedule_entry(self):
+        idx = self._selected_schedule_index()
+        if idx is None:
+            return
+        entry = self.schedule_entries[idx]
+        self.schedule_time_var.set(entry.get("time", "07:00"))
+        self.schedule_count_var.set(int(entry.get("count", 9)))
+        self.schedule_enabled_var.set(bool(entry.get("enabled", True)))
+
+    def _schedule_tick(self):
+        """Fires the matching entries once per day; reschedules itself."""
+        try:
+            now = datetime.datetime.now()
+            hhmm = now.strftime("%H:%M")
+            today = now.strftime("%Y-%m-%d")
+            for entry in self.schedule_entries:
+                if not entry.get("enabled", True):
+                    continue
+                if entry.get("time") != hhmm or entry.get("last_date") == today:
+                    continue
+                entry["last_date"] = today
+                self._refresh_schedule_tree()
+                self.save_settings()
+                self._run_scheduled_session(entry)
+        except Exception as e:
+            logging.error(f"Schedule check failed: {e}")
+        finally:
+            self.master.after(20000, self._schedule_tick)
+
+    def _run_scheduled_session(self, entry):
+        if self.bot_thread is not None and self.bot_thread.is_alive():
+            logging.warning("Scheduled run skipped: a task is already running.")
+            return
+        count = int(entry.get("count", 9))
+        logging.info(f"Scheduled run: 全自动一轮 x{count} starts now (scheduled {entry.get('time')}).")
+        self.mode_var.set('boot_auto')
+        self.play_count_var.set(count)
+        self._on_mode_change()
+        self.start_bot()
+
+    def _init_tray(self):
+        """Create the tray icon; the app keeps scheduling while hidden."""
+        self.tray_icon = None
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+        except Exception as e:
+            logging.warning(f"System tray unavailable ({e}); the window will not minimise to tray.")
+            return
+
+        image = Image.new("RGB", (64, 64), (245, 83, 127))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((8, 8, 56, 56), fill=(255, 255, 255))
+        draw.rectangle((27, 20, 37, 44), fill=(245, 83, 127))
+        draw.ellipse((20, 38, 34, 50), fill=(245, 83, 127))
+
+        menu = pystray.Menu(
+            pystray.MenuItem("显示主界面", lambda: self._tray_call(self._show_from_tray), default=True),
+            pystray.MenuItem("立即运行一轮", lambda: self._tray_call(self._run_tray_session)),
+            pystray.MenuItem("停止任务", lambda: self._tray_call(self.stop_bot)),
+            pystray.MenuItem("退出", lambda: self._tray_call(self.on_app_exit)),
+        )
+        self.tray_icon = pystray.Icon("autodoriUI", image, f"autodoriUI {version.VERSION}", menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        logging.info("System tray icon created.")
+
+    def _tray_call(self, func):
+        """pystray runs on its own thread; hop back to the Tk thread."""
+        self.master.after(0, func)
+
+    def _run_tray_session(self):
+        self._run_scheduled_session({"time": "手动", "count": self.play_count_var.get()})
+
+    def _show_from_tray(self):
+        self.master.deiconify()
+        self.master.lift()
+        self.master.focus_force()
+
+    def _hide_to_tray(self):
+        if self.tray_icon is None:
+            self.on_app_exit()
+            return
+        self.master.withdraw()
+        logging.info("Window hidden to the system tray; scheduled tasks keep running.")
+
+    def _on_close_request(self):
+        """Closing the window keeps the app alive in the tray when possible."""
+        if self.tray_icon is None:
+            self.on_app_exit()
+        else:
+            self._hide_to_tray()
+
     def _update_warnings(self, *args):
         """
         通过改变文字颜色来显示或隐藏警告，而不是从布局中移除它们。
@@ -776,6 +1010,14 @@ class AutodoriGUI:
     def on_app_exit(self):
         """应用程序退出的主处理函数。"""
         logging.info("Application exit requested. Cleaning up resources...")
+
+        # 先收掉托盘图标，避免退出后残留
+        if getattr(self, "tray_icon", None) is not None:
+            try:
+                self.tray_icon.stop()
+                self.tray_icon = None
+            except Exception as e:
+                logging.debug(f"Failed to stop the tray icon: {e}")
 
         # 步骤1：检查并停止正在运行的任务（强制执行一次停止任务函数）
         if self.bot_thread and self.bot_thread.is_alive():
@@ -910,7 +1152,7 @@ if __name__ == "__main__":
         # 显示主窗口并初始化主 GUI
         root.deiconify()
         app = AutodoriGUI(root)
-        root.protocol("WM_DELETE_WINDOW", app.on_app_exit)
+        root.protocol("WM_DELETE_WINDOW", app._on_close_request)
         if AUTO_START:
             root.after(2500, app.auto_start)
 
