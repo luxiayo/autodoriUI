@@ -717,6 +717,24 @@ class AutodoriGUI:
         else:
             pass
 
+    def auto_start(self):
+        """
+        Start a boot-auto session without a click.
+
+        Used by `--auto`, which is what the Windows scheduled task runs at the
+        configured time, so the whole session can run unattended.
+        """
+        if not self.disclaimer_agreed_var.get():
+            logging.warning("--auto requested but the disclaimer has not been accepted; not starting.")
+            return
+        self.mode_var.set('boot_auto')
+        self._on_mode_change()
+        logging.info(
+            f"Automatic start: boot_auto session begins now "
+            f"(difficulty={self.difficulty_var.get()}, songs={self.play_count_var.get()})."
+        )
+        self.start_bot()
+
     def _run_bot_task(self):
         try:
             logging.info("Initialising.")
@@ -862,6 +880,26 @@ if __name__ == "__main__":
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         subprocess.Popen = partial(subprocess.Popen, startupinfo=startupinfo)
 
+    # `--auto` starts the 全自动一轮 session as soon as the UI is ready, so a
+    # scheduled task can run the whole thing unattended.
+    AUTO_START = "--auto" in sys.argv
+
+    # A scheduled run must not start on top of an instance that is already
+    # open, or the two would fight over the emulator.
+    if sys.platform == "win32":
+        import ctypes
+
+        _kernel32 = ctypes.windll.kernel32
+        _instance_mutex = _kernel32.CreateMutexW(None, False, "Local\\autodoriUI_single_instance")
+        if _kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            logging.warning("Another autodoriUI instance is already running; exiting.")
+            if not AUTO_START:
+                _r = tk.Tk()
+                _r.withdraw()
+                messagebox.showwarning("autodoriUI", "已经有一个 autodoriUI 在运行了。")
+                _r.destroy()
+            sys.exit(0)
+
     # 初始化一个隐藏的根窗口
     root = tk.Tk()
     root.withdraw()
@@ -873,6 +911,8 @@ if __name__ == "__main__":
         root.deiconify()
         app = AutodoriGUI(root)
         root.protocol("WM_DELETE_WINDOW", app.on_app_exit)
+        if AUTO_START:
+            root.after(2500, app.auto_start)
 
 
     # 唤起资源检查窗口
