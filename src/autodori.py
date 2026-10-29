@@ -514,7 +514,8 @@ class SavePlayResult(CustomAction):
                     f"Reached the target of {PLAY_COUNT_TARGET} completed songs "
                     f"({PLAY_COMPLETED_COUNT} done). Stopping the task."
                 )
-                context.run_action("close_app")
+                # Leave the game running: the user asked to stay in-game after
+                # a finished session, so only the task stops.
                 context.run_action("stop")
                 return CustomAction.RunResult(True)
 

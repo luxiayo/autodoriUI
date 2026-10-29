@@ -30,7 +30,11 @@
     "next": [
       "single_wait_result"
     ],
-    "timeout": 500000
+    "timeout": 500000,
+    "interrupt": [
+      "next_button",
+      "single_live_failed"
+    ]
   },
   "single_wait_result": {
     "recognition": "TemplateMatch",
@@ -48,6 +52,7 @@
     ],
     "interrupt": [
       "single_live_failed",
+      "next_button",
       "single_ok_button",
       "single_confirm_button",
       "single_close_button"
