@@ -19,6 +19,50 @@ import autodori
 import version
 
 
+# --- 开机启动（HKCU 的 Run 项，无需管理员权限） ---
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_VALUE = "autodoriUI"
+
+
+def autostart_command() -> str:
+    """The command written to the Run key: start hidden in the tray."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --tray'
+    script = os.path.abspath(sys.argv[0])
+    return f'"{sys.executable}" "{script}" --tray'
+
+
+def is_autostart_enabled() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, AUTOSTART_VALUE)
+            return bool(value)
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        logging.debug(f"Reading the autostart entry failed: {e}")
+        return False
+
+
+def set_autostart(enabled: bool):
+    if sys.platform != "win32":
+        raise RuntimeError("开机启动只支持 Windows。")
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, AUTOSTART_VALUE, 0, winreg.REG_SZ, autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(key, AUTOSTART_VALUE)
+            except FileNotFoundError:
+                pass
+
+
 # --- 关键部分：设置日志重定向 ---
 class QueueHandler(logging.Handler):
     def __init__(self, log_queue):
@@ -829,7 +873,31 @@ class AutodoriGUI:
         ttk.Button(btn_row, text="删除选中", command=self._remove_schedule_entry).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_row, text="载入选中", command=self._load_schedule_entry).pack(side=tk.LEFT, padx=2)
 
+        startup_frame = ttk.LabelFrame(parent_frame, text="开机启动")
+        startup_frame.pack(fill=tk.X, pady=(8, 0))
+        self.autostart_var = tk.BooleanVar(value=is_autostart_enabled())
+        ttk.Checkbutton(
+            startup_frame,
+            text="登录 Windows 后自动启动本程序（最小化到托盘，不自动开始任务）",
+            variable=self.autostart_var,
+            command=self._on_autostart_toggle,
+        ).pack(anchor='w', padx=6, pady=4)
+
         self._refresh_schedule_tree()
+
+    def _on_autostart_toggle(self):
+        enabled = bool(self.autostart_var.get())
+        try:
+            set_autostart(enabled)
+        except Exception as e:
+            logging.error(f"Failed to change the autostart entry: {e}")
+            messagebox.showerror("设置失败", f"无法修改开机启动项：\n{e}")
+            self.autostart_var.set(is_autostart_enabled())
+            return
+        if enabled:
+            logging.info(f"Autostart enabled: {autostart_command()}")
+        else:
+            logging.info("Autostart disabled.")
 
     def _refresh_schedule_tree(self):
         if not hasattr(self, "schedule_tree"):
@@ -1125,6 +1193,7 @@ if __name__ == "__main__":
     # `--auto` starts the 全自动一轮 session as soon as the UI is ready, so a
     # scheduled task can run the whole thing unattended.
     AUTO_START = "--auto" in sys.argv
+    TRAY_START = "--tray" in sys.argv
 
     # A scheduled run must not start on top of an instance that is already
     # open, or the two would fight over the emulator.
@@ -1155,6 +1224,9 @@ if __name__ == "__main__":
         root.protocol("WM_DELETE_WINDOW", app._on_close_request)
         if AUTO_START:
             root.after(2500, app.auto_start)
+        elif TRAY_START and app.tray_icon is not None:
+            # Started by the autostart entry: go straight to the tray.
+            root.after(1500, app._hide_to_tray)
 
 
     # 唤起资源检查窗口
