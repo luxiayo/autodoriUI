@@ -98,6 +98,10 @@ HUMAN_DELAY_ENABLED = False
 # always logged; this switch only adds the noisy detail, so leave it off for
 # normal use and turn it on from the 全局变量调试 tab when debugging.
 DEBUG_LOGGING = False
+# Errnos that mean the adb/minitouch pipe died rather than a timing bug:
+# 22 EINVAL (Windows write to a closed pipe), 32 EPIPE, 104 ECONNRESET,
+# 232 EPIPE variant, and the Winsock equivalents.
+CONNECTION_ERRNOS = {22, 32, 104, 232, 10053, 10054, 10060}
 IS_FULL_SONG = False
 IS_HIGH_DIFFICULTY = False
 SUPPORTED_DIFFICULTIES = ['easy', 'normal', 'hard', 'expert', 'special']
@@ -552,6 +556,14 @@ class Play(CustomAction):
         except Exception as e:
             stop_event.set()
             logging.error(f"Error during song playback: {e}", exc_info=True)
+            if is_connection_error(e):
+                # The emulator went away mid-song: that is a device problem,
+                # not a timing problem, so say so and rebuild the pipe.
+                logging.warning(
+                    "The device connection dropped during playback (emulator crash or restart); "
+                    "rebuilding the touch session and resuming from the menus."
+                )
+                rebuild_touch_session()
             return CustomAction.RunResult(False)
         finally:
             monitor.join(timeout=5)
@@ -588,6 +600,16 @@ class RecoverAfterSong(CustomAction):
         )
         if RECOVER_COUNT >= self.MAX_RECOVERIES:
             logging.error("Too many recoveries without finishing a song; stopping the task.")
+            RECOVER_COUNT = 0
+            context.run_action("stop")
+            return CustomAction.RunResult(True)
+        # The reason 再来一次 was missing may be that the emulator went away
+        # mid-song; make sure the capture/touch stack matches a live VM before
+        # walking the menus again.
+        try:
+            revalidate_emulator_stack()
+        except Exception as e:
+            logging.error(f"Emulator is still unusable after the failure, stopping: {e}")
             RECOVER_COUNT = 0
             context.run_action("stop")
         return CustomAction.RunResult(True)
@@ -1464,6 +1486,134 @@ def init():
         raise e
 
 
+def _stop_stale_mnt():
+    global mnt
+    if mnt is not None:
+        try:
+            mnt.stop()
+        except Exception as e:
+            logging.debug(f"Stopping the stale minitouch session failed: {e}")
+        mnt = None
+
+
+def _wait_android_boot_completed(timeout: float = 90.0):
+    """
+    Wait until Android reports sys.boot_completed=1.
+
+    adb starts answering `shell echo` very early in the guest boot, but the
+    MuMu rendering service (nemu IPC) comes up much later - capturing right
+    after the adb probe fails with rpc error 1722 for a while. Only needed
+    after a VM (re)launch; the property read is a no-op on a settled system.
+    """
+    device = _first_adb_device()
+    if device is None:
+        return
+    started = time.time()
+    deadline = started + timeout
+    while time.time() < deadline:
+        if stop_event.is_set():
+            raise RuntimeError("Cancelled while waiting for Android to finish booting.")
+        try:
+            output = subprocess.check_output(
+                [str(device.adb_path.absolute()), "-s", device.address,
+                 "shell", "getprop", "sys.boot_completed"],
+                encoding="utf-8", errors="replace", timeout=10,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            output = ""
+        if output.strip() == "1":
+            logging.info(f"Android boot completed after {time.time() - started:.0f}s.")
+            return
+        time.sleep(2)
+    logging.warning(f"Android did not report boot completion within {timeout:.0f}s; trying anyway.")
+
+
+def revalidate_emulator_stack():
+    """
+    Make sure the capture/touch stack still matches the running emulator.
+
+    The app is long-lived (tray + scheduled runs) while the emulator VM is
+    not: MuMu can be closed, crash, or get restarted during the day. A VM
+    restart invalidates both the MuMu IPC capture handle (capture then
+    returned None and crashed the task with 'NoneType' is not subscriptable)
+    and the minitouch session that ran inside the old VM. Probe the capture
+    path before every task: the probe itself rebuilds the IPC handle, and if
+    that happened the minitouch session is rebuilt as well. Also catches the
+    VM being down at all (observed as a scheduled run flailing on dead
+    captures for minutes): boot_auto then brings the emulator back first.
+    """
+    if current_player is None:
+        return
+    if LIVEMODE == "boot_auto":
+        ensure_emulator_running()
+    try:
+        current_player.ipc_capture_display()
+    except Exception:
+        if LIVEMODE != "boot_auto":
+            raise
+        # A freshly relaunched VM answers adb long before its rendering
+        # service is up - and the service can lag behind sys.boot_completed
+        # too on a cold start. Wait for Android, then give the capture a few
+        # more rounds before declaring the emulator unusable.
+        _wait_android_boot_completed()
+        last = None
+        for _ in range(6):
+            try:
+                current_player.ipc_capture_display()
+                break
+            except Exception as e:
+                last = e
+                time.sleep(5)
+        else:
+            raise RuntimeError(f"Emulator capture is not usable ({last}); cannot start the task.")
+    if getattr(current_player, "reconnected", False):
+        current_player.reconnected = False
+        logging.warning(
+            "Emulator was restarted since the last task; rebuilding the capture/touch stack."
+        )
+        _stop_stale_mnt()
+        init_player_and_mnt()
+        # The controller's own MuMu capture handle died with the old VM; ask
+        # it to reconnect. If that fails it keeps working through its ADB
+        # screencap fallback, just slower.
+        try:
+            maacontroller.post_connection().wait()
+        except Exception as e:
+            logging.debug(f"Controller reconnect after VM restart failed: {e}")
+
+
+def is_connection_error(exc) -> bool:
+    """True when the failure means the device pipe died, not a timing bug."""
+    if isinstance(exc, (BrokenPipeError, ConnectionError)):
+        return True
+    return isinstance(exc, OSError) and getattr(exc, "errno", None) in CONNECTION_ERRNOS
+
+
+def rebuild_touch_session() -> bool:
+    """
+    Rebuild the minitouch session after its adb pipe died mid-song.
+
+    The session lives inside the emulator VM, so a VM crash or restart kills the
+    adb shell that carries it and every later write raises OSError. Bring the
+    emulator back, then create a fresh session.
+    """
+    logging.warning("Rebuilding the minitouch session after the connection loss.")
+    _stop_stale_mnt()
+    try:
+        ensure_emulator_running()
+        device = _first_adb_device()
+        if device is None or not _adb_shell_ready(device):
+            logging.error("The emulator is still unreachable; the touch session stays down.")
+            return False
+        init_player_and_mnt()
+        logging.info("Minitouch session rebuilt.")
+        return True
+    except Exception as e:
+        logging.error(f"Rebuilding the minitouch session failed: {e}")
+        return False
+
+
 def shutdown_resources():
     global mnt, maacontroller, maatasker
 
@@ -1474,21 +1624,14 @@ def shutdown_resources():
     if mnt:
         logging.info("Disconnecting Minitouch...")
         try:
-            mnt.disconnect()
+            mnt.stop()
             mnt = None
         except Exception as e:
             logging.error(f"Error disconnecting Minitouch: {e}", exc_info=True)
 
     if maacontroller:
-        logging.info("Disconnecting MAA AdbController...")
-        try:
-            if maacontroller.post_disconnect().wait().succeeded:
-                logging.info("AdbController disconnected successfully.")
-            else:
-                logging.warning("Failed to disconnect AdbController cleanly.")
-            maacontroller = None
-        except Exception as e:
-            logging.error(f"Error disconnecting AdbController: {e}", exc_info=True)
+        logging.info("Releasing MAA AdbController...")
+        maacontroller = None
 
 
 def run_task_mode():
@@ -1498,6 +1641,8 @@ def run_task_mode():
 
     if not maacontroller or not mnt:
         raise RuntimeError("MAA is not initialised.")
+
+    revalidate_emulator_stack()
 
     PLAY_FAILED_TIMES = 0
     PLAY_COMPLETED_COUNT = 0

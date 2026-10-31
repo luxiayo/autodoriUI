@@ -103,6 +103,9 @@ class AutodoriGUI:
         self.play_count_var = tk.IntVar(value=autodori.PLAY_COUNT_TARGET)
         # [{"time": "07:00", "count": 9, "enabled": True, "last_date": None}]
         self.schedule_entries = []
+        # Auto-resume bookkeeping for interrupted unattended runs.
+        self.auto_restart_count = 0
+        self.last_progress_count = -1
         self.disclaimer_agreed_var = tk.BooleanVar(value=False)
 
         self.config_path = autodori.config_path  # 直接使用后端的 Path 对象
@@ -756,6 +759,7 @@ class AutodoriGUI:
         # A stop from the previous run leaves the event set; clear it or the new
         # startup path (emulator launch, controller connect) aborts immediately.
         autodori.stop_event.clear()
+        self.last_progress_count = -1
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self._update_float_button_state()
@@ -825,6 +829,57 @@ class AutodoriGUI:
             self.stop_button.config(state=tk.DISABLED)
             self.notebook.tab(1, state='normal')
             self._update_float_button_state()
+        self._maybe_resume_session()
+
+    # ---------------- 会话中断后自动续跑 ----------------
+    MAX_AUTO_RESTARTS = 3
+
+    def _maybe_resume_session(self):
+        """
+        Resume an unattended 全自动一轮 run that ended before its target.
+
+        The emulator can crash mid-session (a broken minitouch pipe ends the
+        task). For a scheduled, unattended run that is not a reason to give up:
+        restart the session, which re-initialises and brings the emulator back.
+        Manual stops never resume, and a few failed attempts in a row end it.
+        """
+        if autodori.stop_event.is_set():
+            return
+        if self.mode_var.get() != 'boot_auto':
+            return
+        target = autodori.PLAY_COUNT_TARGET
+        done = autodori.PLAY_COMPLETED_COUNT
+        if target <= 0 or done >= target:
+            self.auto_restart_count = 0
+            return
+        if done > self.last_progress_count:
+            # Progress was made, so the failures are not a stuck loop.
+            self.last_progress_count = done
+            self.auto_restart_count = 0
+        if self.auto_restart_count >= self.MAX_AUTO_RESTARTS:
+            logging.error(
+                f"Session stopped at {done}/{target} and {self.MAX_AUTO_RESTARTS} resume attempts failed; "
+                f"giving up. Check the emulator."
+            )
+            self.auto_restart_count = 0
+            return
+        self.auto_restart_count += 1
+        delay = 60
+        logging.warning(
+            f"Session ended early at {done}/{target}; resuming in {delay}s "
+            f"(attempt {self.auto_restart_count}/{self.MAX_AUTO_RESTARTS})."
+        )
+        self.master.after(delay * 1000, self._resume_session)
+
+    def _resume_session(self):
+        if autodori.stop_event.is_set():
+            logging.info("Resume cancelled: the user pressed stop.")
+            return
+        if self.bot_thread is not None and self.bot_thread.is_alive():
+            return
+        logging.info("Resuming: forcing a full re-initialisation so the emulator is re-checked.")
+        autodori.IS_INITIALISED = False
+        self.start_bot()
 
     def _prevent_resize(self, event):
         """拦截并阻止PanedWindow的尺寸调整事件。"""
@@ -983,12 +1038,24 @@ class AutodoriGUI:
         """Fires the matching entries once per day; reschedules itself."""
         try:
             now = datetime.datetime.now()
-            hhmm = now.strftime("%H:%M")
             today = now.strftime("%Y-%m-%d")
             for entry in self.schedule_entries:
                 if not entry.get("enabled", True):
                     continue
-                if entry.get("time") != hhmm or entry.get("last_date") == today:
+                if entry.get("last_date") == today:
+                    continue
+                try:
+                    scheduled = datetime.datetime.combine(
+                        now.date(),
+                        datetime.datetime.strptime(entry.get("time", "07:00"), "%H:%M").time(),
+                    )
+                except ValueError:
+                    continue
+                # Fire once the time is reached, and still catch up when the
+                # app or the machine came up a few minutes late (observed:
+                # the 06:25 entry was missed because the PC booted at 06:26).
+                # The window is bounded so booting hours later stays quiet.
+                if not (scheduled <= now <= scheduled + datetime.timedelta(minutes=15)):
                     continue
                 entry["last_date"] = today
                 self._refresh_schedule_tree()

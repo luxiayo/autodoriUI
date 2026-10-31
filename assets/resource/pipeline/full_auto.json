@@ -109,6 +109,9 @@
       "wait_for_result_screen"
     ],
     "timeout": 500000,
+    "on_error": [
+      "recover_to_main"
+    ],
     "interrupt": [
       "live_failed",
       "next_button",
