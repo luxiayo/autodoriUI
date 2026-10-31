@@ -102,6 +102,7 @@ DEBUG_LOGGING = False
 # 22 EINVAL (Windows write to a closed pipe), 32 EPIPE, 104 ECONNRESET,
 # 232 EPIPE variant, and the Winsock equivalents.
 CONNECTION_ERRNOS = {22, 32, 104, 232, 10053, 10054, 10060}
+GAME_PACKAGE = "com.bilibili.star.bili"
 IS_FULL_SONG = False
 IS_HIGH_DIFFICULTY = False
 SUPPORTED_DIFFICULTIES = ['easy', 'normal', 'hard', 'expert', 'special']
@@ -1529,6 +1530,87 @@ def _wait_android_boot_completed(timeout: float = 90.0):
     logging.warning(f"Android did not report boot completion within {timeout:.0f}s; trying anyway.")
 
 
+def _game_process_running() -> bool:
+    device = _first_adb_device()
+    if device is None:
+        return False
+    try:
+        output = subprocess.check_output(
+            [str(device.adb_path.absolute()), "-s", device.address, "shell", "pidof", GAME_PACKAGE],
+            encoding="utf-8", errors="replace", timeout=10, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+    return bool(output.strip())
+
+
+def _ensure_game_running(timeout: float = 90.0) -> bool:
+    """
+    Start the game before the task, if it is not running.
+
+    MAA resolves its MuMu capture display when it connects. Connecting while the
+    game is still absent - the usual case right after a cold emulator start -
+    leaves every later screencap failing with "Failed to capture display
+    [ret=2] / Image is empty", and the task then spins without ever seeing a
+    frame. Having the game up first avoids that state.
+    """
+    if _game_process_running():
+        return True
+    device = _first_adb_device()
+    if device is None:
+        return False
+    logging.info("Game is not running; launching it before the task starts.")
+    try:
+        subprocess.run(
+            [str(device.adb_path.absolute()), "-s", device.address, "shell", "monkey",
+             "-p", GAME_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+        )
+    except Exception as e:
+        logging.warning(f"Launching the game failed: {e}")
+        return False
+    started = time.time()
+    while time.time() - started < timeout:
+        if stop_event.is_set():
+            raise RuntimeError("Cancelled while waiting for the game to start.")
+        if _game_process_running():
+            logging.info(f"Game started after {time.time() - started:.0f}s.")
+            return True
+        time.sleep(2)
+    logging.warning("The game did not report a process in time; continuing anyway.")
+    return False
+
+
+def _verify_maa_capture(attempts: int = 3) -> bool:
+    """
+    Check that MAA itself can take a screenshot, reconnecting if it cannot.
+
+    Reconnecting re-resolves MuMu's display for the game, which is what fixes
+    the "capture connected before the game existed" state.
+    """
+    if maacontroller is None:
+        return False
+    for attempt in range(1, attempts + 1):
+        try:
+            image = maacontroller.post_screencap().wait().get()
+        except Exception as e:
+            image = None
+            logging.debug(f"MAA screencap probe raised: {e}")
+        if image is not None:
+            if attempt > 1:
+                logging.info("MAA capture works again after reconnecting the controller.")
+            return True
+        logging.warning(
+            f"MAA cannot capture the screen (attempt {attempt}/{attempts}); reconnecting the controller."
+        )
+        try:
+            maacontroller.post_connection().wait()
+        except Exception as e:
+            logging.debug(f"Controller reconnect failed: {e}")
+        time.sleep(5)
+    return False
+
+
 def revalidate_emulator_stack():
     """
     Make sure the capture/touch stack still matches the running emulator.
@@ -1567,6 +1649,16 @@ def revalidate_emulator_stack():
                 time.sleep(5)
         else:
             raise RuntimeError(f"Emulator capture is not usable ({last}); cannot start the task.")
+
+    # A cold VM produces a launcher frame long before its compositor settles, so
+    # a single successful capture is not proof that the display is stable. Ask
+    # for a few consecutive frames; MAA binds its own handle at connect time and
+    # captured a dead display for minutes when it connected 12 s after the VM
+    # process started.
+    for _ in range(3):
+        current_player.ipc_capture_display()
+        time.sleep(1)
+
     if getattr(current_player, "reconnected", False):
         current_player.reconnected = False
         logging.warning(
@@ -1581,6 +1673,16 @@ def revalidate_emulator_stack():
             maacontroller.post_connection().wait()
         except Exception as e:
             logging.debug(f"Controller reconnect after VM restart failed: {e}")
+
+    # MAA binds its own handle, so the probe above says nothing about whether
+    # the pipeline can see the screen. Check it for real: starting a task on a
+    # controller that cannot capture only spins on "Image is empty".
+    if LIVEMODE == "boot_auto":
+        _ensure_game_running()
+    if not _verify_maa_capture():
+        raise RuntimeError(
+            "The controller cannot capture the emulator screen; restarting the session later."
+        )
 
 
 def is_connection_error(exc) -> bool:
