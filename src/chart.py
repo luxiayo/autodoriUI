@@ -500,7 +500,7 @@ class Chart:
         self.actions_to_cmd_index += size
 
     def dump_debug_config(self):
-        dump_path = Path("debug/dump")
+        dump_path = _data_path("debug/dump")
         dump_path.mkdir(parents=True, exist_ok=True)
         (
                 dump_path / f"{self._song_name}-{self._difficulty}-{time.time()}.yml"

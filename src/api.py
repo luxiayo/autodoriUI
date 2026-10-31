@@ -1,14 +1,45 @@
 import logging
+import sys
+import tempfile
+from pathlib import Path
+
 import requests
 from diskcache import Cache
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
+_logger = logging.getLogger("BestdoriAPI")
+
+
+def _cache_directory() -> Path:
+    """
+    Absolute cache location next to the executable.
+
+    This used to be the relative path "cache", resolved against the current
+    working directory. Windows starts autostart entries with an unrelated CWD
+    (the tray start at boot), so diskcache then tried to create
+    <cwd>\\cache - C:\\Windows\\System32\\cache for a machine-wide Run key -
+    and the import died with PermissionError before the UI could even open.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent
+    else:
+        base = Path(__file__).resolve().parent.parent
+    primary = base / "cache"
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary
+    except OSError as e:
+        fallback = Path(tempfile.gettempdir()) / "autodoriUI-cache"
+        fallback.mkdir(parents=True, exist_ok=True)
+        _logger.warning(f"Cannot use {primary} for the cache ({e}); falling back to {fallback}.")
+        return fallback
+
 
 class BestdoriAPI:
     base = "https://bestdori.com/api"
-    _logger = logging.getLogger("BestdoriAPI")
-    _cache = Cache("cache")
+    _logger = _logger
+    _cache = Cache(str(_cache_directory()))
     _session = requests.Session()
     _adapter = HTTPAdapter(
         max_retries=Retry(
